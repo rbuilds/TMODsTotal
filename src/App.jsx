@@ -6,27 +6,45 @@ import { Menu, X, Plus, Trash2, Edit, Check, ChevronDown, CheckCircle, Clock, XO
 // setLogLevel is imported here to debug firestore connection issues
 import { setLogLevel } from 'firebase/firestore'; 
 
-// CRITICAL FIX: Use the globally injected variables provided by the execution environment.
-// These variables are always present in the hosting environment (not Vite/ENV variables).
-const APP_ID = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-const INITIAL_AUTH_TOKEN = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : '';
+// CRITICAL FIX: The hosting environment might be blocking variables starting with '__'.
+// We define new, Netlify-safe variable names (CANVAS_...) and create global fallbacks 
+// in case the environment *did* use the old names, but prioritize the new system.
+const APP_ID = 
+    typeof __app_id !== 'undefined' ? __app_id : 
+    (typeof CANVAS_APP_ID !== 'undefined' ? CANVAS_APP_ID : 'default-app-id');
+    
+const INITIAL_AUTH_TOKEN = 
+    typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : 
+    (typeof CANVAS_AUTH_TOKEN !== 'undefined' ? CANVAS_AUTH_TOKEN : '');
 
 // Function to construct the Firebase configuration object from global variables
 const getFirebaseConfig = () => {
+    // 1. Prioritize the original environment variable if present (for local dev/canvas environment)
+    let configString = typeof __firebase_config !== 'undefined' ? __firebase_config : '';
+    
+    // 2. Fallback to the Netlify-safe variable name if the original is missing/empty
+    if (!configString && typeof CANVAS_FIREBASE_CONFIG !== 'undefined') {
+        configString = CANVAS_FIREBASE_CONFIG;
+    }
+
+    if (!configString) {
+        console.warn("No Firebase Config string found in any expected global variable.");
+        return {};
+    }
+    
     try {
-        // __firebase_config is provided as a JSON string in the global scope
-        const configString = typeof __firebase_config !== 'undefined' ? __firebase_config : '{}';
-        
         const config = JSON.parse(configString);
 
         // Simple check to ensure we got something meaningful back
         if (!config || Object.keys(config).length === 0 || !config.apiKey) {
-             console.warn("Attempted to parse __firebase_config, but result was empty or invalid.");
-             return {};
+             console.warn(`Attempted to parse config, but result was empty or invalid. Raw string received: "${configString}"`);
+             // Throw an error here to catch it below and surface the configuration issue clearly
+             throw new Error("Missing apiKey or empty configuration object. Check Netlify environment variables.");
         }
         return config;
     } catch (e) {
-        console.error("Failed to parse Firebase config string:", e);
+        // Log the exact string that failed to parse for easier debugging
+        console.error(`Firebase Config Parsing Failed. Raw input: "${configString}" Error: ${e.message}`);
         return {}; 
     }
 };
@@ -145,7 +163,7 @@ const useFirebase = () => {
         const config = firebaseConfig;
 
         if (!config.apiKey) {
-            setError("Configuration Error: Firebase settings are missing. Please ensure __firebase_config is correctly provided.");
+            setError("Configuration Error: Firebase settings are missing. Please ensure CANVAS_FIREBASE_CONFIG is correctly provided.");
             setIsLoading(false);
             return null;
         }
@@ -1466,7 +1484,8 @@ export default function App() {
                 </p>
                 <p className="text-sm text-center bg-red-100 p-3 rounded-lg border border-red-300">
                     Your environment must provide the global variables: 
-                    <code className="block mt-2 font-mono">__app_id, __firebase_config, __initial_auth_token</code>
+                    <code className="block mt-2 font-mono">CANVAS_APP_ID, CANVAS_FIREBASE_CONFIG, CANVAS_AUTH_TOKEN</code> 
+                    (or the internal `__...` versions if running outside Netlify).
                 </p>
                 <p className="text-sm font-semibold mt-4">User ID: {userId}</p>
             </div>
