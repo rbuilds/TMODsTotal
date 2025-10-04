@@ -1,16 +1,12 @@
-/*
-    CRITICAL FIX: In CSS, @import rules (like for fonts) must be placed at the
-    very top of the file, before any other CSS rules, including the @tailwind
-    directives, to avoid build errors. This fixes the potential styling issue.
-*/
+/* 1. CRITICAL: Import fonts/external assets first */
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
 
-/* Tailwind Directives: These are essential for injecting all the utility classes. */
+/* 2. Mandatory Tailwind Directives */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-/* Apply Inter font globally and ensure box model consistency */
+/* 3. Global styles for aesthetics and font */
 body {
     font-family: 'Inter', sans-serif;
     background-color: #f7f9fc; /* Light, clean background */
