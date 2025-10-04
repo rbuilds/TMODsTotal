@@ -171,7 +171,7 @@ const useFirebase = () => {
 
         if (!config.apiKey) {
             if (!error) { // Only set this generic error if a more specific one hasn't been thrown by getFirebaseConfig
-                setError("Configuration Error: Firebase settings are missing. Please ensure VITE_FIREBASE_CONFIG is correctly provided.");
+                setError("Configuration Error: Firebase settings are missing. Please ensure Firebase Config is correctly provided.");
             }
             setIsLoading(false);
             return null;
@@ -192,8 +192,10 @@ const useFirebase = () => {
         const authenticate = async () => {
             try {
                 if (INITIAL_AUTH_TOKEN && INITIAL_AUTH_TOKEN !== 'dummy-auth-token-for-prod') {
+                    // Try to sign in with the provided custom token
                     await signInWithCustomToken(firebaseAuth, INITIAL_AUTH_TOKEN);
                 } else {
+                    // Fallback to anonymous sign-in
                     await signInAnonymously(firebaseAuth);
                 }
             } catch (err) {
@@ -269,7 +271,9 @@ const useFirebase = () => {
 
         }, (e) => {
             console.error("Firestore Snapshot Error:", e);
-            setError(`Failed to load data: ${e.message}`);
+            // Crucial: The main reason for this failure is usually security rules blocking the read.
+            // A 400 Bad Request error on the stream often indicates 'permission-denied'.
+            setError(`Failed to load data. Please check your Firebase Firestore Security Rules for read access on 'artifacts/${APP_ID}/public/data/'. Error: ${e.message}`);
             setIsLoading(false);
         });
 
@@ -325,7 +329,7 @@ const useFirebase = () => {
             console.log("Default data committed. Waiting for Snapshot update...");
         } catch (e) {
             console.error("Batch commit failed:", e);
-            setError(`Database Initialization Failed: ${e.message}`);
+            setError(`Database Initialization Failed: ${e.message}. Please verify your network connection and Firebase security rules.`);
         }
     };
 
@@ -1537,19 +1541,7 @@ export default function App() {
 
     return (
         <div className="flex min-h-screen bg-gray-50">
-            {/* Sidebar (Desktop) */}
-            <div className="hidden md:block">
-                <Sidebar 
-                    isOpen={isSidebarOpen} 
-                    toggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)} 
-                    currentPage={currentPage} 
-                    setCurrentPage={setCurrentPage} 
-                    scopes={scopes}
-                    userId={userId}
-                />
-            </div>
-
-            {/* Sidebar (Mobile/Overlay) */}
+            {/* Sidebar (Rendered once, CSS handles desktop vs mobile visibility) */}
             <Sidebar 
                 isOpen={isSidebarOpen} 
                 toggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)} 
@@ -1558,7 +1550,6 @@ export default function App() {
                 scopes={scopes}
                 userId={userId}
             />
-
 
             {/* Main Content Area */}
             <div className="flex-grow flex flex-col transition-all duration-300">
