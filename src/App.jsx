@@ -6,58 +6,32 @@ import { Menu, X, Plus, Trash2, Edit, Check, ChevronDown, CheckCircle, Clock, XO
 // setLogLevel is imported here to debug firestore connection issues
 import { setLogLevel } from 'firebase/firestore'; 
 
-// --- Configuration Source Determination (Vite environment variables take precedence) ---
+// --- Hardcoded Fallback Configuration (Implements User's Settings) ---
+// Since environment variables proved unreliable during deployment, we hardcode the configuration
+// here. This ensures the application always starts with the correct keys.
 
-// Helper function to safely read environment variables from various sources.
-// We prioritize global variables (set by the canvas environment) or rely on 
-// the Netlify/Vite process environment for the VITE_ prefixed keys.
-// Note: When running in a real Netlify build, Vite replaces the VITE_ keys with string literals.
-const getConfigValue = (viteKey, internalKey, defaultValue) => {
-    // 1. Try to read from the standard internal/canvas global variable (e.g., __app_id)
-    if (typeof window !== 'undefined' && typeof window[internalKey] !== 'undefined' && window[internalKey] !== '') {
-        return window[internalKey];
-    }
-    
-    // 2. Try to read from the VITE_ prefixed keys, assuming they are injected by the build tool.
-    // We cannot use import.meta.env inside the function scope due to the build warning.
-    // Instead, we rely on the environment *outside* this React context where VITE_ variables are defined.
-    
-    // **CRITICAL FIX:** In production, Vite replaces VITE_ variables with string constants.
-    // Since we can't use import.meta here, we trust the deployment guide and assume 
-    // the value is either provided globally or hardcoded by the build tool.
-    
-    // We rely on the values being defined in the outer scope via string replacement
-    // during the build step, which is how Vite is designed to work.
-    // Since we cannot inspect the build's string replacement process here, we must rely 
-    // exclusively on the global variables as a robust fallback for the most critical data.
-    
-    // To fix the compilation error, we remove all references to 'import.meta'
-    // and rely on the global variables being correctly provisioned externally.
-    
-    return defaultValue;
-};
+const HARDCODED_APP_ID = 'tmods-overall';
+const HARDCODED_AUTH_TOKEN = 'dummy-auth-token-for-prod'; // Safe token placeholder
+const HARDCODED_CONFIG_JSON = '{"apiKey":"AIzaSyCjLWKCJMmW3PiJ8SyZXDpA7QCTfbJyME8", "authDomain": "tmods-overall.firebaseapp.com", "projectId": "tmods-overall", "storageBucket": "tmods-overall.firebasestorage.app", "messagingSenderId": "672257211065", "appId": "1:672257211065:web:9e2eba91a621e984ca7968", "measurementId": "G-0TZBL5W7G9"}';
 
-// Use the VITE_ prefixed keys for external deployments, but access via assumed globals/context
-// The actual values for APP_ID, INITIAL_AUTH_TOKEN, and the config object are expected to be 
-// correctly provided by the environment setup (Netlify ENV variables + the VITE prefix).
-// If the app fails to run again, the issue is certainly the VITE_ variable mapping in Netlify's build process.
-const APP_ID = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-const INITIAL_AUTH_TOKEN = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : '';
+// We access the final value by prioritizing the internal Canvas globals, then the hardcoded strings.
+const APP_ID = typeof __app_id !== 'undefined' ? __app_id : HARDCODED_APP_ID;
+const INITIAL_AUTH_TOKEN = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : HARDCODED_AUTH_TOKEN;
 
 // Function to construct the Firebase configuration object from environment variables
 const getFirebaseConfig = () => {
-    // We rely ONLY on the internal global variable __firebase_config for safe parsing 
-    // because this is the only variable guaranteed to be accessible and non-Vite-dependent 
-    // in this development environment structure.
+    // 1. Prioritize the string provided by the Canvas global variable (for this editor environment)
+    // 2. Fallback to the hardcoded JSON string provided by the user.
+    let configString = typeof __firebase_config !== 'undefined' ? __firebase_config : HARDCODED_CONFIG_JSON;
     
-    // NOTE: When deploying to Netlify, the user MUST ensure VITE_FIREBASE_CONFIG is a valid JSON string
-    // because that's the only way for the application to get the configuration details.
+    if (!configString) {
+        console.warn("No Firebase Config string found in any expected variable.");
+        return {};
+    }
     
-    // For this environment, we still have to use the canvas globals for the application to run here:
-    const configString = typeof __firebase_config !== 'undefined' ? __firebase_config : '{}';
-    
-    if (!configString || configString === '{}' || configString === '""') {
-        console.warn("No Firebase Config string found in global variable (__firebase_config).");
+    // Safety checks before parsing
+    if (configString === '{}' || configString === '""' || configString === 'null' || configString.length < 10) {
+        console.warn(`Firebase Config string found, but is empty, boilerplate, or too short. Raw string received: "${configString}"`);
         return {};
     }
     
@@ -66,15 +40,12 @@ const getFirebaseConfig = () => {
 
         if (!config || Object.keys(config).length === 0 || !config.apiKey) {
              console.warn(`Attempted to parse config, but result was empty or missing apiKey. Raw string received: "${configString}"`);
-             // We throw the error for the display component to catch
              throw new Error("Missing or invalid Firebase configuration object (VITE_FIREBASE_CONFIG must be a valid JSON string).");
         }
         return config;
     } catch (e) {
-        // Log the exact string that failed to parse for easier debugging
         console.error(`Firebase Config Parsing Failed. Raw input: "${configString}" Error: ${e.message}`);
-        // Surface a user-friendly error message
-        throw new Error(`Invalid JSON format in Firebase configuration: ${e.message}`);
+        throw new Error(`Invalid JSON format in Firebase configuration. Please check the VITE_FIREBASE_CONFIG value in Netlify.`);
     }
 };
 
