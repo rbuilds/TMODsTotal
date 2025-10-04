@@ -1,19 +1,16 @@
-/* 1. CRITICAL: Font loading is often best handled in index.html for production reliability. */
-/* @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap'); -- REMOVED: Please add <link> tag to index.html for robust loading. */
-
-/* Universal Box-Sizing Reset */
+/* Global Reset for Box Model Consistency */
 *, ::before, ::after {
     box-sizing: border-box;
 }
 
-/* 2. Mandatory Tailwind Directives */
+/* 1. Mandatory Tailwind Directives */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-/* 3. Global styles for aesthetics and font */
+/* 2. Global styles for aesthetics and font fallback */
 body {
-    /* FIX: Added system fallbacks for reliability */
+    /* Uses the 'Inter' font defined in index.html, falling back to Arial/Helvetica/sans-serif */
     font-family: 'Inter', Arial, Helvetica, sans-serif;
-    background-color: #f7f9fc; /* Light, clean background */
+    background-color: #f7f9fc;
 }
