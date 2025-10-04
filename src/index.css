@@ -1,0 +1,12 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom font setup for a modern look */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+
+/* Apply Inter font globally and ensure box model consistency */
+body {
+    font-family: 'Inter', sans-serif;
+    background-color: #f7f9fc; /* Light, clean background */
+}
