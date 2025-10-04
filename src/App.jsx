@@ -1,485 +1,540 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, doc, setDoc, onSnapshot, collection, query, writeBatch } from 'firebase/firestore';
-import { Menu, X, CheckCircle, Clock, XCircle, ChevronDown, ChevronUp, Plus, Trash2, Loader, LayoutDashboard, Settings, Edit, Upload, FileText, Image, Download } from 'lucide-react';
+import { getFirestore, doc, setDoc, collection, query, onSnapshot, writeBatch } from 'firebase/firestore';
+import { Menu, X, Plus, Trash2, Edit, Check, ChevronDown, CheckCircle, Clock, XOctagon } from 'lucide-react';
+// setLogLevel is imported here to debug firestore connection issues
+import { setLogLevel } from 'firebase/firestore'; 
 
-// --- FIREBASE CONFIGURATION & UTILITIES ---
+// CRITICAL FIX: Use the globally injected variables provided by the execution environment.
+// These variables are always present in the hosting environment (not Vite/ENV variables).
+const APP_ID = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const INITIAL_AUTH_TOKEN = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : '';
 
-// Global variables provided by the environment
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-mcr4-tmods-app-id';
-const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
-const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+// Function to construct the Firebase configuration object from global variables
+const getFirebaseConfig = () => {
+    try {
+        // __firebase_config is provided as a JSON string in the global scope
+        const configString = typeof __firebase_config !== 'undefined' ? __firebase_config : '{}';
+        
+        const config = JSON.parse(configString);
 
-// Convert firestore timestamp to readable string
-const timeConverter = (timestamp) => {
-  if (timestamp?.toDate) {
-    return timestamp.toDate().toLocaleDateString('en-US', {
-      year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
-    });
-  }
-  return 'N/A';
+        // Simple check to ensure we got something meaningful back
+        if (!config || Object.keys(config).length === 0 || !config.apiKey) {
+             console.warn("Attempted to parse __firebase_config, but result was empty or invalid.");
+             return {};
+        }
+        return config;
+    } catch (e) {
+        console.error("Failed to parse Firebase config string:", e);
+        return {}; 
+    }
 };
 
-// --- DATA STRUCTURE & LOGIC UTILITIES ---
+// --- Utility Functions (rest remain unchanged) ---
 
-const SCOPE_NAMES = [
-  'Lead Abatement',
-  '4113a Civil Mod Interferences',
-  '4113b FIF and Monorail',
-  '4113c Feeder Lifting Frame',
-  '4115a MET Civil',
-  '4115b MET Mechanical',
-  'Helium Supply Line removal',
-  '4219 Header restraints Install'
+// Converts an object (like a Date or Firestore Timestamp) to a serializable string.
+const sanitizeData = (data) => {
+    if (!data) return data;
+    return JSON.parse(JSON.stringify(data));
+};
+
+// Calculates the status badge color based on completion percentage.
+const getStatusColor = (percent) => {
+    if (percent === 100) return 'bg-green-600';
+    if (percent > 0) return 'bg-yellow-500';
+    return 'bg-red-500';
+};
+// Helper for text colors in SVG
+const getTextColor = (percent) => {
+    if (percent === 100) return 'text-green-600';
+    if (percent > 0) return 'text-yellow-500';
+    return 'text-red-500';
+};
+
+
+// Determines the label based on completion percentage.
+const getStatusLabel = (percent) => {
+    if (percent === 100) return 'Complete';
+    if (percent > 0) return 'In Progress';
+    return 'Not Started';
+};
+
+// Calculates overall completion percentage for an array of items (like parts or actions).
+const calculateOverallCompletion = (items) => {
+    if (!items || items.length === 0) return 0;
+    const totalPercent = items.reduce((sum, item) => sum + (item.percentComplete || 0), 0);
+    return Math.round(totalPercent / items.length);
+};
+
+// Calculates completion percentage based on completed steps.
+const calculateStepCompletion = (steps) => {
+    if (!steps || steps.length === 0) return 0;
+    const completed = steps.filter(step => step.completed).length;
+    return Math.round((completed / steps.length) * 100);
+};
+
+// Generates the default structure for a new Part/Drawing.
+const createDefaultPart = (title) => ({
+    id: crypto.randomUUID(),
+    title: title || `New Part ${crypto.randomUUID().slice(0, 4)}`,
+    imageUrl: '',
+    actions: [],
+    // For Lead Abatement, this is used to link to other scopes
+    relatedScopeId: 'none', 
+    percentComplete: 0,
+});
+
+// Defines the initial structure for all scopes (TMODs)
+const initialScopesData = [
+    { id: 'summary', title: 'MCR4 TMODs Summary', type: 'summary' },
+    { id: 'lead_abatement', title: 'Lead Abatement', type: 'scope' },
+    { id: '4113a', title: '4113a Civil Mod Interferences', type: 'scope' },
+    { id: '4113b', title: '4113b FIF and Monorail', type: 'scope' },
+    { id: '4113c', title: '4113c Feeder Lifting Frame', type: 'scope' },
+    { id: '4115a', title: '4115a MET Civil', type: 'scope' },
+    { id: '4115b', title: '4115b MET Mechanical', type: 'scope' },
+    { id: 'helium_removal', title: 'Helium Supply Line removal', type: 'scope' },
+    { id: '4219', title: "4219 'Header restraints Install'", type: 'scope' },
 ];
 
-const LEAD_ABATEMENT_TITLE = 'Lead Abatement';
-const LEAD_ABATEMENT_ID = 'lead_abatement';
-const OTHER_SCOPES = SCOPE_NAMES.filter(name => name !== LEAD_ABATEMENT_TITLE);
-
-const getStatusColor = (status) => {
-  switch (status) {
-    case 'Complete': return 'bg-green-100 text-green-700 border-green-500';
-    case 'In Progress': return 'bg-yellow-100 text-yellow-700 border-yellow-500';
-    case 'Not Started': return 'bg-red-100 text-red-700 border-red-500';
-    case 'N/A': return 'bg-gray-100 text-gray-700 border-gray-500';
-    default: return 'bg-gray-100 text-gray-700 border-gray-500';
-  }
-};
-
-/**
- * Checks if a prerequisite key supports step-based tracking.
- */
-const isStepPrereq = (key) => key === 'materials' || key === 'generalPrereqs';
-
-/**
- * Calculates the percentage complete based on steps.
- * @param {Array<Object>} steps
- * @returns {number} percentage
- */
-const calculatePercentFromSteps = (steps) => {
-    if (!steps || steps.length === 0) {
-        return 0;
-    }
-    const completedSteps = steps.filter(s => s.isComplete).length;
-    const totalSteps = steps.length;
-    return totalSteps > 0 ? Math.round((completedSteps / totalSteps) * 100) : 0;
-};
-
-
-/**
- * Calculates the overall status for a drawing based on its actions.
- * @param {Array<Object>} actions
- * @returns {'red'|'yellow'|'green'}
- */
-const getDrawingStatus = (actions) => {
-  if (!actions || actions.length === 0) return 'red';
-
-  let totalPercent = 0;
-  let validActions = 0;
-
-  actions.forEach(action => {
-      // Calculate percent based on steps in the action modal
-      const currentPercent = calculatePercentFromSteps(action.steps);
-      totalPercent += currentPercent;
-      validActions++;
-  });
-
-  if (validActions === 0) return 'red';
-
-  const overallAverage = totalPercent / validActions;
-
-  if (overallAverage === 100) return 'green'; // All 100%
-  if (overallAverage === 0) return 'red'; // All 0%
-  if (overallAverage > 0 && overallAverage < 100) return 'yellow'; // Mixed or anything started but not all finished
-
-  return 'red'; // Fallback to Not Started
-};
-
-const getStatusBorder = (status) => {
-  switch (status) {
-    case 'green': return 'border-green-500';
-    case 'yellow': return 'border-yellow-500';
-    case 'red': return 'border-red-500';
-    default: return 'border-gray-300';
-  }
-};
-
-/**
- * Calculates the total completion percentage of lead abatement items
- * specifically related to a given target scope.
- * @param {Object} allScopes - The full scopes object from Firestore.
- * @param {string} targetScopeId - The ID of the scope being checked (e.g., '4113a_civil_mod_interferences').
- * @returns {{percent: number, totalSteps: number, completedSteps: number, linkedItemsCount: number}}
- */
-const getLeadAbatementProgressForScope = (allScopes, targetScopeId) => {
-    const abatementScope = allScopes[LEAD_ABATEMENT_ID];
-
-    if (!abatementScope || !abatementScope.drawings) {
-        return { percent: 0, totalSteps: 0, completedSteps: 0, linkedItemsCount: 0 };
-    }
-
-    // Filter drawings in the Lead Abatement scope that are linked to the current target scope
-    const relevantDrawings = abatementScope.drawings.filter(
-        d => d.relatedScopeId === targetScopeId
-    );
-    
-    if (relevantDrawings.length === 0) {
-        return { percent: 0, totalSteps: 0, completedSteps: 0, linkedItemsCount: 0 }; 
-    }
-
-    let totalSteps = 0;
-    let completedSteps = 0;
-    
-    relevantDrawings.forEach(drawing => {
-        drawing.actions.forEach(action => {
-            // NOTE: Even for simplified abatement actions, completion is determined by steps (usually just one step)
-            totalSteps += action.steps?.length || 0;
-            completedSteps += (action.steps || []).filter(s => s.isComplete).length;
-        });
-    });
-
-    const percent = totalSteps > 0 ? Math.round((completedSteps / totalSteps) * 100) : 0;
-    
-    return { percent, totalSteps, completedSteps, linkedItemsCount: relevantDrawings.length };
-};
-
-
-/**
- * Generates initial data for a single scope page.
- */
-const createDefaultScopeData = (title) => {
-  const scopeId = title.toLowerCase().replace(/[^a-z0-9]+/g, '_');
-  const defaultDrawingName = `${title.substring(0, 4)}-PART-${Math.floor(Math.random() * 900) + 100}`;
-
-  return {
+// Creates the default data structure for a standard scope page (non-Lead Abatement).
+const createDefaultScopeData = (scopeId) => ({
     id: scopeId,
-    title,
-    // Prereqs now use objects to hold status, steps, and notes
-    prereqs: {
-      materials: {
-          status: 'Not Started',
-          notes: 'Initial material requisition and long-lead item tracking.',
-          steps: [
-              { id: crypto.randomUUID(), description: 'Issue Material Request (MR)', isComplete: false },
-              { id: crypto.randomUUID(), description: 'Confirm long-lead items delivery date', isComplete: false },
-              { id: crypto.randomUUID(), description: 'Verify materials received against bill of materials', isComplete: false }
-          ]
-      },
-      leadAbatement: {
-          // Status is ignored for non-Lead Abatement scopes, but needed for initialization
-          status: title.includes('Lead') ? 'In Progress' : 'Not Started', 
-          notes: title.includes('Lead') ? 'Abatement area defined and isolation setup started.' : 'Status derived from linked abatement items.',
-          steps: []
-      },
-      generalPrereqs: {
-          status: 'Not Started',
-          notes: 'Obtaining required permits and access clearances.',
-          steps: [
-              { id: crypto.randomUUID(), description: 'Obtain Area Access Permit (AAP)', isComplete: false },
-              { id: crypto.randomUUID(), description: 'Complete Job Hazard Analysis (JHA)', isComplete: false }
-          ]
-      }
-    },
-    drawings: [
-      {
-        id: crypto.randomUUID(),
-        name: defaultDrawingName,
-        description: `Part/Area requiring modification for ${title}`,
-        imageUrl: '', // For temporary client-side image display
-        relatedScopeId: null, // Field to link abatement items to the related scope
-        actions: [
-          {
-            id: crypto.randomUUID(),
-            description: 'Perform Initial Site Survey',
-            percentComplete: 0,
-            notes: 'Check for potential interferences.',
-            // Default actions for abatement should be single step for simple checkmark functionality
-            steps: [{ id: crypto.randomUUID(), description: 'Action complete?', isComplete: false }],
-            imageAttachment: null, // Stores { name } for local display
-          },
+    // Prereqs that use simple dropdown status
+    prereqStatusLeadAbatement: 'Not Started', 
+    
+    // Prereqs that use step tracking (initial status is set by step completion)
+    prereqStatusMaterials: {
+        status: 'Not Started',
+        notes: '',
+        steps: [
+            { id: crypto.randomUUID(), text: 'Material Order Placed', completed: false },
         ]
-      },
+    },
+    prereqStatusGeneral: {
+        status: 'Not Started',
+        notes: '',
+        steps: [
+            { id: crypto.randomUUID(), text: 'Welders Certified', completed: false },
+        ]
+    },
+    parts: [
+        createDefaultPart('Drawing 01-A'),
+        createDefaultPart('Drawing 01-B'),
     ]
-  };
-};
+});
 
-// --- FIREBASE HOOK ---
+
+// --- Firebase Hook ---
+
 const useFirebase = () => {
-  const [db, setDb] = useState(null);
-  const [auth, setAuth] = useState(null);
-  const [userId, setUserId] = useState(null);
-  const [isAuthReady, setIsAuthReady] = useState(false);
-  const [scopes, setScopes] = useState({});
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState(null);
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [scopes, setScopes] = useState([]);
+    const [isLoading, setIsLoading] = useState(true);
+    const [error, setError] = useState('');
 
-  // 1. Initialization and Authentication
-  useEffect(() => {
-    if (!firebaseConfig) {
-      console.error("Firebase config is missing.");
-      setError("Configuration Error: Firebase settings are missing.");
-      setIsLoading(false);
-      return;
-    }
+    const firebaseConfig = useMemo(getFirebaseConfig, []);
+    const firebaseApp = useMemo(() => {
+        // Log levels for better debugging in the console
+        setLogLevel('debug');
+        
+        // Use the config object directly
+        const config = firebaseConfig;
 
-    try {
-      const app = initializeApp(firebaseConfig);
-      const firestore = getFirestore(app);
-      const authInstance = getAuth(app);
-
-      setDb(firestore);
-      setAuth(authInstance);
-
-      const handleAuth = async (user) => {
-        if (user) {
-          setUserId(user.uid);
-        } else {
-          // If the initial token didn't work or user signed out, sign in anonymously
-          await signInAnonymously(authInstance);
+        if (!config.apiKey) {
+            setError("Configuration Error: Firebase settings are missing. Please ensure __firebase_config is correctly provided.");
+            setIsLoading(false);
+            return null;
         }
-        setIsAuthReady(true);
-      };
+        return initializeApp(config);
+    }, [firebaseConfig]);
 
-      // Set up the listener for auth state changes
-      const unsubscribe = onAuthStateChanged(authInstance, (user) => {
-        if (!user && initialAuthToken) {
-          // Attempt custom sign-in if token exists
-          signInWithCustomToken(authInstance, initialAuthToken)
-            .then(({ user: customUser }) => handleAuth(customUser))
-            .catch(async (e) => {
-              console.error("Custom token sign-in failed. Falling back to anonymous.", e);
-              await signInAnonymously(authInstance);
-            });
-        } else {
-          handleAuth(user);
-        }
-      });
+    // 1. Initialization and Authentication
+    useEffect(() => {
+        if (!firebaseApp) return;
 
-      return () => unsubscribe();
+        const firestore = getFirestore(firebaseApp);
+        const firebaseAuth = getAuth(firebaseApp);
 
-    } catch (e) {
-      console.error("Firebase initialization failed:", e);
-      setError("Firebase Initialization Failed. Check configuration.");
-      setIsLoading(false);
-    }
-  }, []);
+        setDb(firestore);
+        setAuth(firebaseAuth);
 
-  // 2. Data Listener (onSnapshot) and Initialization
-  useEffect(() => {
-    if (db && isAuthReady) {
-      const collectionPath = `/artifacts/${appId}/public/data/scopes`;
-      const q = query(collection(db, collectionPath));
+        const authenticate = async () => {
+            try {
+                if (INITIAL_AUTH_TOKEN && INITIAL_AUTH_TOKEN !== 'dummy-auth-token-for-prod') {
+                    await signInWithCustomToken(firebaseAuth, INITIAL_AUTH_TOKEN);
+                } else {
+                    await signInAnonymously(firebaseAuth);
+                }
+            } catch (err) {
+                console.error("Firebase Authentication Failed:", err);
+                setError(`Authentication failed. Check your Firebase rules.`);
+            }
+        };
 
-      const unsubscribe = onSnapshot(q, async (querySnapshot) => {
-        // We set loading true here to cover the time taken to process the snapshot/commit batch
-        // The final resolution to false happens only on success or explicit error.
-        setIsLoading(true); 
-        const fetchedScopes = {};
-        querySnapshot.forEach((doc) => {
-          fetchedScopes[doc.id] = doc.data();
+        const unsubscribe = onAuthStateChanged(firebaseAuth, (user) => {
+            if (user) {
+                setUserId(user.uid);
+                console.log(`User Authenticated. UID: ${user.uid}`);
+            } else {
+                // We use the temporary user ID (from anon sign-in or a new UUID) 
+                // but wait for the auth process to finish.
+                setUserId(firebaseAuth.currentUser?.uid || crypto.randomUUID()); 
+                console.log("Authentication state changed: User is logged out or anonymous.");
+            }
         });
 
-        if (querySnapshot.empty) {
-          console.log("Snapshot 1: Scopes collection is empty. Initializing data...");
-          // If empty, commit the batch and rely on the subsequent snapshot to resolve loading.
-          const batch = writeBatch(db);
-          SCOPE_NAMES.forEach(title => {
-            const scopeData = createDefaultScopeData(title);
-            const docRef = doc(db, collectionPath, scopeData.id);
-            batch.set(docRef, scopeData);
-          });
-          try {
-             await batch.commit();
-             console.log("Default data committed. Waiting for Snapshot 2 (Real-time update)...");
-             // Do NOT set setScopes or setIsLoading(false) here. Wait for the triggered snapshot (Snapshot 2).
-          } catch (batchError) {
-             console.error("Batch commit failed:", batchError);
-             setError("Failed to initialize project data: " + batchError.message);
-             setIsLoading(false); // Resolve loading on failure
-          }
-        } else {
-          // Snapshot 2 (or a normal snapshot) has data. Resolve loading state.
-          console.log(`Snapshot received. Found ${querySnapshot.size} scopes. Loading complete.`);
-          setScopes(fetchedScopes);
-          setIsLoading(false); // Resolve loading only when data is successfully fetched
+        authenticate();
+        return () => unsubscribe();
+    }, [firebaseApp]);
+
+    // 2. Data Synchronization (Scopes and Parts)
+    useEffect(() => {
+        // Wait for db and authenticated userId to be ready, or if an error occurred.
+        if (!db || !userId || error) return; 
+
+        // Public collection path as per security rules
+        const scopesColRef = collection(db, 'artifacts', APP_ID, 'public', 'data', 'scopes');
+        const scopesQuery = query(scopesColRef);
+
+        const unsubscribe = onSnapshot(scopesQuery, async (querySnapshot) => {
+            console.log("Firestore Snapshot received.");
+            
+            let fetchedScopes = [];
+
+            if (querySnapshot.empty) {
+                console.log("Scopes collection is empty. Initializing data...");
+                setIsLoading(true);
+                await initializeDefaultData(db, userId);
+                // Keep loading until the next snapshot confirms data presence
+                return; 
+            }
+
+            // Process fetched data
+            querySnapshot.forEach(doc => {
+                // Ensure doc data exists before adding
+                const data = doc.data();
+                if (data) {
+                    fetchedScopes.push(sanitizeData(data));
+                }
+            });
+
+            // Merge fetched data with default structure to ensure all scopes are present
+            const updatedScopes = initialScopesData.map(defaultScope => {
+                const fetchedScope = fetchedScopes.find(s => s.id === defaultScope.id);
+                if (fetchedScope) {
+                    // Deep merge the fetched data over the defaults
+                    return { ...defaultScope, ...fetchedScope };
+                }
+                // If a default scope is missing from the database, use its structure
+                if (defaultScope.type === 'scope') {
+                    return { ...defaultScope, ...createDefaultScopeData(defaultScope.id) };
+                }
+                return defaultScope;
+            });
+            
+            console.log(`Found ${updatedScopes.length} scopes. Loading complete.`);
+            setScopes(updatedScopes);
+            setIsLoading(false);
+
+        }, (e) => {
+            console.error("Firestore Snapshot Error:", e);
+            setError(`Failed to load data: ${e.message}`);
+            setIsLoading(false);
+        });
+
+        return () => unsubscribe();
+    }, [db, userId, error]);
+
+
+    // Data initialization helper
+    const initializeDefaultData = async (firestore, currentUserId) => {
+        const batch = writeBatch(firestore);
+
+        // 1. Create a public user document to store the user's ID
+        const userDocRef = doc(firestore, 'artifacts', APP_ID, 'public', 'data', 'users', currentUserId);
+        batch.set(userDocRef, { userId: currentUserId, createdAt: new Date() });
+
+        // 2. Create documents for all scope pages
+        const allScopesToInit = initialScopesData.map(scope => {
+            if (scope.type === 'scope') {
+                return { ...scope, ...createDefaultScopeData(scope.id) };
+            } else if (scope.id === 'summary') {
+                return scope;
+            }
+            return null;
+        }).filter(Boolean);
+
+        // Special handling for Lead Abatement to avoid default prereqs
+        const leadAbatementScopeId = 'lead_abatement';
+        const leadAbatementIndex = allScopesToInit.findIndex(s => s.id === leadAbatementScopeId);
+        if (leadAbatementIndex !== -1) {
+            allScopesToInit[leadAbatementIndex] = {
+                ...allScopesToInit[leadAbatementIndex],
+                prereqStatusLeadAbatement: 'N/A',
+                prereqStatusMaterials: { status: 'N/A', notes: '', steps: [] },
+                prereqStatusGeneral: { status: 'N/A', notes: '', steps: [] },
+                parts: [
+                    createDefaultPart('Piping Section A1'),
+                    createDefaultPart('Containment Area B'),
+                ]
+            };
         }
-      }, (e) => {
-        console.error("Firestore data snapshot failed:", e);
-        setError("Error fetching project data: " + e.message);
-        setIsLoading(false); // Resolve loading on any snapshot error
-      });
 
-      return () => unsubscribe();
-    }
-  }, [db, isAuthReady]);
+        allScopesToInit.forEach(scope => {
+            const scopeData = {
+                ...scope,
+                createdAt: new Date(),
+            };
+            const docRef = doc(firestore, 'artifacts', APP_ID, 'public', 'data', 'scopes', scope.id);
+            batch.set(docRef, scopeData);
+        });
+        
+        try {
+            await batch.commit();
+            console.log("Default data committed. Waiting for Snapshot update...");
+        } catch (e) {
+            console.error("Batch commit failed:", e);
+            setError(`Database Initialization Failed: ${e.message}`);
+        }
+    };
 
-  // 3. Update Function
-  const updateScopeData = useCallback(async (scopeId, updatedData) => {
-    if (!db) return console.error("Database not initialized.");
-    try {
-      const collectionPath = `/artifacts/${appId}/public/data/scopes`;
-      const docRef = doc(db, collectionPath, scopeId);
-      await setDoc(docRef, updatedData, { merge: false }); // Overwrite the specific scope document
-      console.log(`Scope ${scopeId} updated successfully.`);
-    } catch (e) {
-      console.error("Error updating document: ", e);
-      setError("Failed to save progress: " + e.message);
-    }
-  }, [db]);
 
-  return { scopes, userId, isLoading, error, updateScopeData };
+    // Update function for scope data
+    const updateScopeData = useCallback(async (scopeId, data) => {
+        if (!db) {
+            console.error("Firestore not initialized.");
+            return;
+        }
+
+        try {
+            const docRef = doc(db, 'artifacts', APP_ID, 'public', 'data', 'scopes', scopeId);
+            // Use setDoc with merge: true for partial updates
+            await setDoc(docRef, sanitizeData(data), { merge: true });
+        } catch (e) {
+            console.error("Error updating document:", e);
+            setError(`Error updating document: ${e.message}`);
+        }
+    }, [db]);
+
+
+    return { scopes, userId, updateScopeData, isLoading, error, db };
 };
 
-// --- PREREQUISITE MODAL COMPONENT ---
 
-const PrereqModal = ({ prereqKey, prereqData, scope, onClose, updateScopeData }) => {
-    const [currentPrereq, setCurrentPrereq] = useState(prereqData);
-    const [newStep, setNewStep] = useState('');
+// --- Component Utilities ---
 
-    const titleMap = {
-        materials: 'Materials Tracking Steps',
-        generalPrereqs: 'General Prerequisite Steps',
-        leadAbatement: 'Lead Abatement Process'
-    };
-    const title = titleMap[prereqKey] || prereqKey;
-    const isTrackable = isStepPrereq(prereqKey);
-    const percentComplete = isTrackable ? calculatePercentFromSteps(currentPrereq.steps) : 0;
+// Generates a status indicator circle and label
+const StatusBadge = ({ percent, readOnly }) => {
+    const color = getStatusColor(percent);
+    const label = getStatusLabel(percent);
+    const icon = percent === 100 ? CheckCircle : percent > 0 ? Clock : XOctagon;
 
-    const handleSave = () => {
-        let updatedStatus = currentPrereq.status;
-        
-        if (isTrackable) {
-            const percent = calculatePercentFromSteps(currentPrereq.steps);
-            if (percent === 100) updatedStatus = 'Complete';
-            else if (percent > 0) updatedStatus = 'In Progress';
-            else updatedStatus = 'Not Started';
-        }
+    return (
+        <div className={`flex items-center space-x-2 text-sm font-semibold ${readOnly ? 'text-gray-500' : 'text-gray-800'}`}>
+            <span className={`w-3 h-3 rounded-full ${color}`} />
+            <span>{label}</span>
+        </div>
+    );
+};
 
-        const updatedPrereq = { 
-            ...currentPrereq, 
-            status: updatedStatus,
-            lastUpdated: new Date()
-        };
-        
-        const newPrereqs = { ...scope.prereqs, [prereqKey]: updatedPrereq };
-        updateScopeData(scope.id, { ...scope, prereqs: newPrereqs });
-        onClose();
-    };
+// Generates a small progress circle for the summary view
+const MiniCircularProgress = ({ percent }) => {
+    const radius = 15;
+    const circumference = 2 * Math.PI * radius;
+    const offset = circumference - (percent / 100) * circumference;
+    const strokeColor = getTextColor(percent);
 
-    const handleStepToggle = (stepId) => {
-        const newSteps = currentPrereq.steps.map(step => 
-            step.id === stepId ? { ...step, isComplete: !step.isComplete } : step
-        );
-        setCurrentPrereq(prev => ({ ...prev, steps: newSteps }));
+    return (
+        <div className="relative w-10 h-10 flex items-center justify-center">
+            <svg className="w-full h-full transform -rotate-90" viewBox="0 0 32 32">
+                {/* Background track */}
+                <circle
+                    cx="16"
+                    cy="16"
+                    r={radius}
+                    fill="transparent"
+                    stroke="#e5e7eb"
+                    strokeWidth="3"
+                />
+                {/* Progress bar */}
+                <circle
+                    cx="16"
+                    cy="16"
+                    r={radius}
+                    fill="transparent"
+                    stroke="currentColor"
+                    strokeWidth="3"
+                    strokeDasharray={circumference}
+                    strokeDashoffset={offset}
+                    className={strokeColor}
+                />
+            </svg>
+            <span className="absolute text-[10px] font-bold text-gray-700">
+                {percent}%
+            </span>
+        </div>
+    );
+};
+
+// Calculates overall progress for Lead Abatement based on linked parts
+const getLeadAbatementProgressForScope = (scopeId, allScopes) => {
+    const leadAbatementScope = allScopes.find(s => s.id === 'lead_abatement');
+    if (!leadAbatementScope || !leadAbatementScope.parts) {
+        return { percent: 0, count: 0 };
+    }
+
+    const linkedParts = leadAbatementScope.parts.filter(part => part.relatedScopeId === scopeId);
+
+    if (linkedParts.length === 0) {
+        return { percent: 0, count: 0, isLinked: false };
+    }
+
+    // Calculate total steps completed vs total steps available across all linked parts
+    const totalSteps = linkedParts.reduce((sum, part) => sum + part.actions.reduce((s, a) => s + (a.steps?.length || 0), 0), 0);
+    const completedSteps = linkedParts.reduce((sum, part) => sum + part.actions.reduce((s, a) => s + (a.steps?.filter(step => step.completed).length || 0), 0), 0);
+    
+    const percent = totalSteps === 0 ? 0 : Math.round((completedSteps / totalSteps) * 100);
+
+    return { percent, count: linkedParts.length, isLinked: true };
+};
+
+
+// --- Modals ---
+
+// Modal for tracking steps and notes for Materials and General Prerequisites
+const PrereqModal = ({ isOpen, onClose, prereqKey, scope, updateScopeData }) => {
+    if (!isOpen) return null;
+
+    const prereqData = scope[prereqKey];
+    const [notes, setNotes] = useState(prereqData.notes || '');
+    const [steps, setSteps] = useState(prereqData.steps || []);
+    const [newStepText, setNewStepText] = useState('');
+
+    const calculatedPercent = calculateStepCompletion(steps);
+
+    const handleStepToggle = (id) => {
+        setSteps(steps.map(step =>
+            step.id === id ? { ...step, completed: !step.completed } : step
+        ));
     };
 
     const handleAddStep = () => {
-        if (newStep.trim()) {
-            const step = {
-                id: crypto.randomUUID(),
-                description: newStep.trim(),
-                isComplete: false,
-            };
-            setCurrentPrereq(prev => ({ ...prev, steps: [...prev.steps, step] }));
-            setNewStep('');
+        if (newStepText.trim()) {
+            setSteps([...steps, { id: crypto.randomUUID(), text: newStepText.trim(), completed: false }]);
+            setNewStepText('');
         }
     };
 
-    const handleDeleteStep = (stepId) => {
-        const newSteps = currentPrereq.steps.filter(step => step.id !== stepId);
-        setCurrentPrereq(prev => ({ ...prev, steps: newSteps }));
+    const handleDeleteStep = (id) => {
+        setSteps(steps.filter(step => step.id !== id));
+    };
+
+    const handleSave = () => {
+        const newStatus = getStatusLabel(calculatedPercent);
+
+        const updatedScope = {
+            ...scope,
+            [prereqKey]: {
+                ...prereqData,
+                status: newStatus,
+                notes: notes,
+                steps: steps,
+            }
+        };
+
+        updateScopeData(scope.id, updatedScope);
+        onClose();
+    };
+
+    const titleMap = {
+        prereqStatusMaterials: 'Materials Tracking',
+        prereqStatusGeneral: 'General Prereqs Tracking',
     };
 
     return (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-70 p-4" onClick={onClose}>
-            <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg md:max-w-xl max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
-                
-                {/* Modal Header */}
-                <div className="p-5 border-b flex justify-between items-center sticky top-0 bg-white rounded-t-xl">
-                    <h3 className="text-xl font-bold text-gray-800 flex items-center">
-                        <CheckCircle className="w-6 h-6 mr-2 text-green-600"/> {title}
-                    </h3>
-                    <button onClick={onClose} className="p-2 rounded-full hover:bg-gray-100 transition">
-                        <X className="w-5 h-5 text-gray-500"/>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50 p-4">
+            <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col">
+                {/* Header */}
+                <div className="p-5 border-b flex justify-between items-center bg-gray-50 rounded-t-xl">
+                    <h2 className="text-xl font-bold text-gray-800">{titleMap[prereqKey]}</h2>
+                    <button onClick={onClose} className="text-gray-500 hover:text-gray-800 p-2 rounded-full transition">
+                        <X size={20} />
                     </button>
                 </div>
-
-                {/* Modal Content */}
-                <div className="p-5 space-y-6">
-                    
-                    {isTrackable && (
-                        <div className="space-y-2">
-                            <div className="text-lg font-semibold text-gray-700">Completion Status: {percentComplete}%</div>
-                            <div className="w-full bg-gray-200 rounded-full h-3">
-                                <div className="h-3 rounded-full transition-all duration-500" style={{ width: `${percentComplete}%`, backgroundColor: percentComplete === 100 ? '#10B981' : (percentComplete > 0 ? '#F59E0B' : '#EF4444') }}></div>
-                            </div>
+                
+                <div className="overflow-y-auto p-6 space-y-6">
+                    {/* Progress Bar */}
+                    <div className="bg-gray-100 rounded-lg p-4">
+                        <div className="font-semibold text-lg mb-2 text-gray-700">Completion: {calculatedPercent}%</div>
+                        <div className="w-full bg-gray-200 rounded-full h-3">
+                            <div 
+                                className={`h-3 rounded-full transition-all duration-500 ${getStatusColor(calculatedPercent)}`} 
+                                style={{ width: `${calculatedPercent}%` }}
+                            />
                         </div>
-                    )}
+                    </div>
 
-                    {/* Step Tracker */}
-                    {isTrackable && (
-                        <div className="bg-gray-50 p-4 rounded-lg border">
-                            <h4 className="font-bold text-gray-800 mb-3 flex items-center">
-                                <FileText className="w-4 h-4 mr-2 text-blue-600"/> Execution Steps ({currentPrereq.steps.filter(s => s.isComplete).length}/{currentPrereq.steps.length})
-                            </h4>
-                            <div className="space-y-2">
-                                {currentPrereq.steps.map(step => (
-                                    <div key={step.id} className="flex items-center p-2 rounded-md hover:bg-white transition bg-white shadow-sm">
-                                        <input 
-                                            type="checkbox" 
-                                            checked={step.isComplete} 
-                                            onChange={() => handleStepToggle(step.id)}
-                                            className="h-5 w-5 text-blue-600 rounded border-gray-300 focus:ring-blue-500 cursor-pointer"
-                                        />
-                                        <span className={`ml-3 text-sm flex-1 ${step.isComplete ? 'line-through text-gray-500' : 'text-gray-800'}`}>
-                                            {step.description}
-                                        </span>
-                                        <button onClick={() => handleDeleteStep(step.id)} className="text-red-400 hover:text-red-600 p-1 transition">
-                                            <Trash2 className="w-4 h-4" />
-                                        </button>
-                                    </div>
-                                ))}
-                            </div>
-
-                            {/* Add New Step */}
-                            <div className="flex mt-3 space-x-2">
-                                <input
-                                    type="text"
-                                    placeholder="Add new step..."
-                                    value={newStep}
-                                    onChange={(e) => setNewStep(e.target.value)}
-                                    onKeyDown={(e) => e.key === 'Enter' && handleAddStep()}
-                                    className="flex-1 p-2 border rounded-lg text-sm focus:ring-blue-500 focus:border-blue-500"
-                                />
-                                <button onClick={handleAddStep} className="bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700 transition">
-                                    <Plus className="w-5 h-5" />
+                    {/* Step List */}
+                    <div className="space-y-3">
+                        <h3 className="text-lg font-bold text-gray-800 border-b pb-2">Execution Steps ({steps.length})</h3>
+                        {steps.map(step => (
+                            <div key={step.id} className="flex items-center justify-between bg-white p-3 border rounded-lg shadow-sm">
+                                <label className="flex items-center flex-grow cursor-pointer">
+                                    <input 
+                                        type="checkbox" 
+                                        checked={step.completed} 
+                                        onChange={() => handleStepToggle(step.id)} 
+                                        className="form-checkbox h-5 w-5 text-indigo-600 rounded"
+                                    />
+                                    <span className={`ml-3 text-gray-700 ${step.completed ? 'line-through text-gray-500' : ''}`}>
+                                        {step.text}
+                                    </span>
+                                </label>
+                                <button onClick={() => handleDeleteStep(step.id)} className="text-red-500 hover:text-red-700 p-1 rounded-full transition ml-4">
+                                    <Trash2 size={16} />
                                 </button>
                             </div>
+                        ))}
+
+                        {/* Add Step Input */}
+                        <div className="flex space-x-2 pt-2">
+                            <input 
+                                type="text" 
+                                value={newStepText} 
+                                onChange={(e) => setNewStepText(e.target.value)} 
+                                placeholder="Add new step..."
+                                className="flex-grow p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                            />
+                            <button onClick={handleAddStep} className="bg-indigo-600 text-white p-2 rounded-lg hover:bg-indigo-700 transition flex items-center">
+                                <Plus size={18} />
+                            </button>
                         </div>
-                    )}
-                    
+                    </div>
+
                     {/* Notes Section */}
                     <div>
-                        <h4 className="font-bold text-gray-800 mb-2">Notes</h4>
+                        <h3 className="text-lg font-bold text-gray-800 mb-2 border-b pb-1">Notes</h3>
                         <textarea
-                            value={currentPrereq.notes}
-                            onChange={(e) => setCurrentPrereq(prev => ({ ...prev, notes: e.target.value }))}
-                            placeholder="Add detailed notes or observations..."
-                            rows="3"
-                            className="w-full p-2 text-sm border rounded-lg focus:ring-blue-500 focus:border-blue-500 transition bg-white"
+                            value={notes}
+                            onChange={(e) => setNotes(e.target.value)}
+                            rows="4"
+                            placeholder="Add detailed notes here..."
+                            className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 resize-none"
                         />
                     </div>
                 </div>
 
-                {/* Modal Footer */}
-                <div className="p-4 border-t flex justify-end sticky bottom-0 bg-white rounded-b-xl">
+                {/* Footer */}
+                <div className="p-4 border-t flex justify-end bg-gray-50 rounded-b-xl">
                     <button 
                         onClick={handleSave} 
-                        className="bg-green-600 text-white p-3 rounded-lg font-semibold hover:bg-green-700 transition shadow-lg"
+                        className="bg-green-600 text-white px-5 py-2 rounded-lg font-semibold hover:bg-green-700 transition shadow-md"
                     >
-                        Save & Close
+                        Save Changes
                     </button>
                 </div>
             </div>
@@ -488,206 +543,473 @@ const PrereqModal = ({ prereqKey, prereqData, scope, onClose, updateScopeData })
 };
 
 
-// --- ACTION MODAL COMPONENT (Only used for non-abatement scopes) ---
+// Modal for tracking steps, notes, and temporary image for Part Actions
+const ActionModal = ({ isOpen, onClose, action, scope, part, updateScopeData }) => {
+    if (!isOpen) return null;
 
-const ActionModal = ({ action, scope, drawing, onClose, updateScopeData }) => {
-    const [currentAction, setCurrentAction] = useState(action);
-    const [newStep, setNewStep] = useState('');
-    const [tempImage, setTempImage] = useState(action.imageAttachment || null); 
+    const [steps, setSteps] = useState(action.steps || []);
+    const [notes, setNotes] = useState(action.notes || '');
+    const [newStepText, setNewStepText] = useState('');
+    const [dataURL, setDataURL] = useState(null); // Temporary image data URL
 
-    const percentComplete = useMemo(() => 
-        calculatePercentFromSteps(currentAction.steps)
-    , [currentAction.steps]);
+    const calculatedPercent = calculateStepCompletion(steps);
 
-
-    const handleSave = () => {
-        let attachmentToPersist = null;
-        if (tempImage) {
-            attachmentToPersist = { name: tempImage.name };
-        }
-
-        const updatedAction = { 
-            ...currentAction, 
-            percentComplete: percentComplete, 
-            imageAttachment: attachmentToPersist, 
-            lastUpdated: new Date()
-        };
-
-        const newDrawings = scope.drawings.map(d => {
-            if (d.id === drawing.id) {
-                return {
-                    ...d,
-                    actions: d.actions.map(a => 
-                        a.id === action.id ? updatedAction : a
-                    )
-                };
-            }
-            return d;
-        });
-
-        updateScopeData(scope.id, { ...scope, drawings: newDrawings });
-        onClose();
-    };
-
-    const handleStepToggle = (stepId) => {
-        const newSteps = currentAction.steps.map(step => 
-            step.id === stepId ? { ...step, isComplete: !step.isComplete } : step
-        );
-        setCurrentAction(prev => ({ ...prev, steps: newSteps }));
+    const handleStepToggle = (id) => {
+        setSteps(steps.map(step =>
+            step.id === id ? { ...step, completed: !step.completed } : step
+        ));
     };
 
     const handleAddStep = () => {
-        if (newStep.trim()) {
-            const step = {
-                id: crypto.randomUUID(),
-                description: newStep.trim(),
-                isComplete: false,
-            };
-            setCurrentAction(prev => ({ ...prev, steps: [...prev.steps, step] }));
-            setNewStep('');
+        if (newStepText.trim()) {
+            setSteps([...steps, { id: crypto.randomUUID(), text: newStepText.trim(), completed: false }]);
+            setNewStepText('');
         }
     };
 
-    const handleDeleteStep = (stepId) => {
-        const newSteps = currentAction.steps.filter(step => step.id !== stepId);
-        setCurrentAction(prev => ({ ...prev, steps: newSteps }));
+    const handleDeleteStep = (id) => {
+        setSteps(steps.filter(step => step.id !== id));
     };
 
     const handleImageUpload = (e) => {
         const file = e.target.files[0];
-        if (file && file.type.startsWith('image/')) {
+        if (file) {
             const reader = new FileReader();
-            reader.onload = (event) => {
-                setTempImage({
-                    name: file.name,
-                    dataURL: event.target.result 
-                });
+            reader.onloadend = () => {
+                setDataURL(reader.result);
+                // NOTE: We DO NOT call updateScopeData here to avoid saving the massive Base64 string to Firestore.
+                // The image remains temporary (session-only).
             };
             reader.readAsDataURL(file);
-        } else if (file) {
-            console.error("Please upload a valid image file.");
         }
     };
 
+    const handleSave = () => {
+        const updatedAction = {
+            ...action,
+            notes: notes,
+            steps: steps,
+            percentComplete: calculatedPercent,
+            // We only save basic metadata about the image, NOT the large dataURL itself.
+            imageAttachment: dataURL ? { name: `Attachment-${new Date().toISOString()}`, saved: false } : null,
+        };
+
+        const updatedParts = scope.parts.map(p => {
+            if (p.id === part.id) {
+                const updatedActions = p.actions.map(a => 
+                    a.id === action.id ? updatedAction : a
+                );
+                // Recalculate part completion based on updated actions
+                const partCompletion = calculateOverallCompletion(updatedActions);
+                return { ...p, actions: updatedActions, percentComplete: partCompletion };
+            }
+            return p;
+        });
+
+        const updatedScope = { ...scope, parts: updatedParts };
+        updateScopeData(scope.id, updatedScope);
+        onClose();
+    };
+
     return (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-70 p-4" onClick={onClose}>
-            <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg md:max-w-xl max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
-                
-                {/* Modal Header */}
-                <div className="p-5 border-b flex justify-between items-center sticky top-0 bg-white rounded-t-xl">
-                    <h3 className="text-xl font-bold text-gray-800 flex items-center">
-                        <FileText className="w-6 h-6 mr-2 text-blue-600"/> {action.description}
-                    </h3>
-                    <button onClick={onClose} className="p-2 rounded-full hover:bg-gray-100 transition">
-                        <X className="w-5 h-5 text-gray-500"/>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50 p-4">
+            <div className="bg-white rounded-xl shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col">
+                {/* Header */}
+                <div className="p-5 border-b flex justify-between items-center bg-gray-50 rounded-t-xl">
+                    <h2 className="text-xl font-bold text-gray-800">Action: {action.title}</h2>
+                    <button onClick={onClose} className="text-gray-500 hover:text-gray-800 p-2 rounded-full transition">
+                        <X size={20} />
                     </button>
                 </div>
-
-                {/* Modal Content */}
-                <div className="p-5 space-y-6">
-                    
-                    {/* Progress Bar */}
-                    <div className="space-y-2">
-                        <div className="text-lg font-semibold text-gray-700">Completion Status: {percentComplete}%</div>
-                        <div className="w-full bg-gray-200 rounded-full h-3">
-                            <div className="h-3 rounded-full transition-all duration-500" style={{ width: `${percentComplete}%`, backgroundColor: percentComplete === 100 ? '#10B981' : (percentComplete > 0 ? '#F59E0B' : '#EF4444') }}></div>
+                
+                <div className="overflow-y-auto p-6 grid grid-cols-1 md:grid-cols-2 gap-8">
+                    {/* Left Column: Steps and Notes */}
+                    <div className="space-y-6">
+                        {/* Progress Bar */}
+                        <div className="bg-gray-100 rounded-lg p-4 shadow-inner">
+                            <div className="font-semibold text-lg mb-2 text-gray-700">Action Progress: {calculatedPercent}%</div>
+                            <div className="w-full bg-gray-200 rounded-full h-3">
+                                <div 
+                                    className={`h-3 rounded-full transition-all duration-500 ${getStatusColor(calculatedPercent)}`} 
+                                    style={{ width: `${calculatedPercent}%` }}
+                                />
                             </div>
                         </div>
-                    
 
-                    {/* Step Tracker */}
-                    <div className="bg-gray-50 p-4 rounded-lg border">
-                        <h4 className="font-bold text-gray-800 mb-3 flex items-center">
-                            <CheckCircle className="w-4 h-4 mr-2 text-green-600"/> Execution Steps ({currentAction.steps.filter(s => s.isComplete).length}/{currentAction.steps.length})
-                        </h4>
-                        <div className="space-y-2">
-                            {currentAction.steps.map(step => (
-                                <div key={step.id} className="flex items-center p-2 rounded-md hover:bg-white transition bg-white shadow-sm">
-                                    <input 
-                                        type="checkbox" 
-                                        checked={step.isComplete} 
-                                        onChange={() => handleStepToggle(step.id)}
-                                        className="h-5 w-5 text-blue-600 rounded border-gray-300 focus:ring-blue-500 cursor-pointer"
-                                    />
-                                    <span className={`ml-3 text-sm flex-1 ${step.isComplete ? 'line-through text-gray-500' : 'text-gray-800'}`}>
-                                        {step.description}
-                                    </span>
-                                    <button onClick={() => handleDeleteStep(step.id)} className="text-red-400 hover:text-red-600 p-1 transition">
-                                        <Trash2 className="w-4 h-4" />
+                        {/* Step List */}
+                        <div className="space-y-3">
+                            <h3 className="text-lg font-bold text-gray-800 border-b pb-2">Execution Steps ({steps.length})</h3>
+                            {steps.map(step => (
+                                <div key={step.id} className="flex items-center justify-between bg-white p-3 border rounded-lg shadow-sm transition hover:shadow-md">
+                                    <label className="flex items-center flex-grow cursor-pointer">
+                                        <input 
+                                            type="checkbox" 
+                                            checked={step.completed} 
+                                            onChange={() => handleStepToggle(step.id)} 
+                                            className="form-checkbox h-5 w-5 text-indigo-600 rounded"
+                                        />
+                                        <span className={`ml-3 text-gray-700 ${step.completed ? 'line-through text-gray-500' : ''}`}>
+                                            {step.text}
+                                        </span>
+                                    </label>
+                                    <button onClick={() => handleDeleteStep(step.id)} className="text-red-500 hover:text-red-700 p-1 rounded-full transition ml-4">
+                                        <Trash2 size={16} />
+                                    </button>
+                                </div>
+                            ))}
+
+                            {/* Add Step Input */}
+                            <div className="flex space-x-2 pt-2">
+                                <input 
+                                    type="text" 
+                                    value={newStepText} 
+                                    onChange={(e) => setNewStepText(e.target.value)} 
+                                    placeholder="Add new step..."
+                                    className="flex-grow p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                                />
+                                <button onClick={handleAddStep} className="bg-indigo-600 text-white p-2 rounded-lg hover:bg-indigo-700 transition flex items-center">
+                                    <Plus size={18} />
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* Notes Section */}
+                        <div>
+                            <h3 className="text-lg font-bold text-gray-800 mb-2 border-b pb-1">Notes</h3>
+                            <textarea
+                                value={notes}
+                                onChange={(e) => setNotes(e.target.value)}
+                                rows="3"
+                                placeholder="Add detailed notes here..."
+                                className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 resize-none shadow-sm"
+                            />
+                        </div>
+                    </div>
+                    
+                    {/* Right Column: Image Attachment */}
+                    <div className="space-y-4">
+                        <h3 className="text-lg font-bold text-gray-800 border-b pb-2">Image Attachment (Session Only)</h3>
+                        <div className="border-2 border-dashed border-gray-300 rounded-xl p-6 text-center shadow-inner bg-white">
+                            <input 
+                                id="image-upload" 
+                                type="file" 
+                                accept="image/jpeg, image/png, image/jpg" 
+                                onChange={handleImageUpload} 
+                                className="hidden"
+                            />
+                            <label htmlFor="image-upload" className="cursor-pointer bg-blue-500 text-white px-4 py-2 rounded-lg font-semibold hover:bg-blue-600 transition inline-flex items-center shadow-md">
+                                <Plus size={18} className="mr-2" />
+                                Upload Image
+                            </label>
+                            <p className="text-xs text-gray-500 mt-2">Max 1MB. Image is only visible in the current session.</p>
+                        </div>
+
+                        {dataURL && (
+                            <div className="relative border rounded-lg overflow-hidden shadow-lg">
+                                <img src={dataURL} alt="Attachment Preview" className="w-full h-auto object-cover"/>
+                            </div>
+                        )}
+                    </div>
+                </div>
+
+                {/* Footer */}
+                <div className="p-4 border-t flex justify-end bg-gray-50 rounded-b-xl">
+                    <button 
+                        onClick={handleSave} 
+                        className="bg-green-600 text-white px-6 py-3 rounded-xl font-bold hover:bg-green-700 transition shadow-lg"
+                    >
+                        Save Action Progress
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+
+// --- Core Components ---
+
+// Renders the details for a single Part/Drawing/Thing needing Abating
+const DrawingCard = ({ part, scope, updateScopeData, allScopes, isLeadAbatementScope, otherScopeIds }) => {
+    const [isEditingTitle, setIsEditingTitle] = useState(false);
+    const [newTitle, setNewTitle] = useState(part.title);
+    const [actionModalOpen, setActionModalOpen] = useState(false);
+    const [selectedAction, setSelectedAction] = useState(null);
+    const [localImageUrl, setLocalImageUrl] = useState(part.imageUrl); // For temporary display
+
+    // Determine the color for the Part card border
+    const borderColor = useMemo(() => {
+        if (part.percentComplete === 100) return 'border-green-600';
+        if (part.percentComplete > 0) return 'border-yellow-500';
+        return 'border-red-500';
+    }, [part.percentComplete]);
+
+
+    const handleRename = () => {
+        if (newTitle.trim() === part.title) {
+            setIsEditingTitle(false);
+            return;
+        }
+
+        const updatedParts = scope.parts.map(p =>
+            p.id === part.id ? { ...p, title: newTitle.trim() } : p
+        );
+        updateScopeData(scope.id, { ...scope, parts: updatedParts });
+        setIsEditingTitle(false);
+    };
+
+    const handleDeletePart = () => {
+        // Use a custom confirmation modal in a real app, but using window.confirm for simplicity here.
+        if (!window.confirm(`Are you sure you want to delete Part: ${part.title}?`)) return;
+
+        const updatedParts = scope.parts.filter(p => p.id !== part.id);
+        updateScopeData(scope.id, { ...scope, parts: updatedParts });
+    };
+
+    const handleActionToggle = (actionId) => {
+        // Only for Lead Abatement (simple checkbox toggle)
+        if (!isLeadAbatementScope) return;
+
+        const updatedActions = part.actions.map(a => 
+            a.id === actionId ? { ...a, percentComplete: a.percentComplete === 100 ? 0 : 100, steps: a.steps.map(s => ({...s, completed: a.percentComplete === 0})) } : a
+        );
+        
+        const partCompletion = calculateOverallCompletion(updatedActions);
+
+        const updatedParts = scope.parts.map(p =>
+            p.id === part.id ? { ...p, actions: updatedActions, percentComplete: partCompletion } : p
+        );
+        updateScopeData(scope.id, { ...scope, parts: updatedParts });
+    };
+
+
+    const handleActionClick = (action) => {
+        if (isLeadAbatementScope) {
+            // If Lead Abatement, clicking toggles completion directly (handled by handleActionToggle)
+            handleActionToggle(action.id);
+        } else {
+            // For standard scopes, clicking opens the modal for step tracking
+            setSelectedAction(action);
+            setActionModalOpen(true);
+        }
+    };
+
+
+    const handleImageUpload = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                setLocalImageUrl(reader.result);
+                // NOTE: We do not update Firestore here. The image is temporary (session-only).
+            };
+            reader.readAsDataURL(file);
+        }
+    };
+    
+    const handleRelatedScopeChange = (e) => {
+        const newScopeId = e.target.value;
+        const updatedParts = scope.parts.map(p => 
+            p.id === part.id ? { ...p, relatedScopeId: newScopeId } : p
+        );
+        updateScopeData(scope.id, { ...scope, parts: updatedParts });
+    };
+
+    const handleAddAction = () => {
+        // Use a custom modal instead of prompt in a real app
+        const newActionTitle = window.prompt("Enter title for new action:");
+        if (newActionTitle) {
+            const newAction = {
+                id: crypto.randomUUID(),
+                title: newActionTitle,
+                percentComplete: 0,
+                notes: '',
+                steps: isLeadAbatementScope ? [{ id: crypto.randomUUID(), text: 'Complete Abatement Task', completed: false }] : [{ id: crypto.randomUUID(), text: 'Perform Task 1', completed: false }],
+            };
+            const updatedParts = scope.parts.map(p =>
+                p.id === part.id ? { ...p, actions: [...p.actions, newAction] } : p
+            );
+            
+            // Recalculate part completion
+            const newPart = updatedParts.find(p => p.id === part.id);
+            if (newPart) {
+                newPart.percentComplete = calculateOverallCompletion(newPart.actions);
+            }
+
+            updateScopeData(scope.id, { ...scope, parts: updatedParts });
+        }
+    };
+    
+    const handleDeleteAction = (actionId) => {
+        const updatedActions = part.actions.filter(a => a.id !== actionId);
+        const partCompletion = calculateOverallCompletion(updatedActions);
+
+        const updatedParts = scope.parts.map(p =>
+            p.id === part.id ? { ...p, actions: updatedActions, percentComplete: partCompletion } : p
+        );
+        updateScopeData(scope.id, { ...scope, parts: updatedParts });
+    };
+
+    const partCompletionPercent = part.percentComplete || 0;
+
+    return (
+        <div className={`bg-white rounded-xl shadow-lg border-b-4 ${borderColor} transition-shadow duration-300 hover:shadow-xl`}>
+            {/* Action Modal (only for standard scopes) */}
+            {selectedAction && !isLeadAbatementScope && (
+                <ActionModal 
+                    isOpen={actionModalOpen} 
+                    onClose={() => setActionModalOpen(false)} 
+                    action={selectedAction} 
+                    scope={scope} 
+                    part={part}
+                    updateScopeData={updateScopeData} 
+                />
+            )}
+
+            <div className="p-5 space-y-4">
+                {/* Header (Title & Controls) */}
+                <div className="flex justify-between items-center border-b pb-3">
+                    <div className="flex items-center space-x-2">
+                        {isEditingTitle ? (
+                            <input
+                                type="text"
+                                value={newTitle}
+                                onChange={(e) => setNewTitle(e.target.value)}
+                                onBlur={handleRename}
+                                onKeyDown={(e) => { if (e.key === 'Enter') handleRename(); }}
+                                className="text-lg font-bold p-1 border-b border-indigo-500 focus:outline-none"
+                                autoFocus
+                            />
+                        ) : (
+                            <h3 className="text-lg font-bold text-gray-800 flex items-center">
+                                {part.title}
+                                <button onClick={() => setIsEditingTitle(true)} className="ml-2 text-gray-400 hover:text-indigo-500 transition">
+                                    <Edit size={16} />
+                                </button>
+                            </h3>
+                        )}
+                    </div>
+                    
+                    <div className="flex items-center space-x-2">
+                        <StatusBadge percent={partCompletionPercent} />
+                        <button onClick={handleDeletePart} className="text-red-500 hover:text-red-700 p-1 rounded-full transition bg-red-50 hover:bg-red-100">
+                            <Trash2 size={18} />
+                        </button>
+                    </div>
+                </div>
+
+                {/* Main Content Area */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    {/* Left Column: Image / Status */}
+                    <div className="md:col-span-1 space-y-3">
+                        <div className="relative w-full aspect-[4/3] bg-gray-100 rounded-lg overflow-hidden shadow-inner flex items-center justify-center border">
+                            {localImageUrl ? (
+                                <img src={localImageUrl} alt={part.title} className="w-full h-full object-cover" />
+                            ) : (
+                                <span className="text-gray-500 text-sm">No Image</span>
+                            )}
+                        </div>
+
+                        {/* Image Upload */}
+                        <div className="flex flex-col items-center">
+                            <input 
+                                id={`image-upload-${part.id}`} 
+                                type="file" 
+                                accept="image/jpeg, image/png, image/jpg" 
+                                onChange={handleImageUpload} 
+                                className="hidden"
+                            />
+                            <label htmlFor={`image-upload-${part.id}`} className="cursor-pointer text-indigo-600 hover:text-indigo-700 text-sm font-semibold transition">
+                                Upload/Change Image
+                            </label>
+                            <p className="text-xs text-gray-500 mt-1">Image is session-only (not saved).</p>
+                        </div>
+                    </div>
+                    
+                    {/* Middle Column: Progress Bar & Related Scope Picker */}
+                    <div className="md:col-span-1 space-y-3">
+                        {/* Progress Bar */}
+                        <div className="p-3 bg-gray-50 rounded-lg shadow-sm border">
+                            <h4 className="text-sm font-semibold mb-1 text-gray-700">Completion: {partCompletionPercent}%</h4>
+                            <div className="w-full bg-gray-200 rounded-full h-2">
+                                <div 
+                                    className={`h-2 rounded-full transition-all duration-500 ${getStatusColor(partCompletionPercent)}`} 
+                                    style={{ width: `${partCompletionPercent}%` }}
+                                />
+                            </div>
+                        </div>
+
+                        {/* Related Scope Picker (Lead Abatement Only) */}
+                        {isLeadAbatementScope && (
+                            <div className="mt-4 p-3 bg-indigo-50 rounded-lg border border-indigo-200">
+                                <label className="block text-sm font-medium text-indigo-700 mb-1">Related TMOD Scope</label>
+                                <select 
+                                    value={part.relatedScopeId || 'none'}
+                                    onChange={handleRelatedScopeChange}
+                                    className="w-full p-2 border border-indigo-300 rounded-lg text-sm focus:ring-indigo-500 focus:border-indigo-500 bg-white"
+                                >
+                                    <option value="none">-- Select Scope (Not Linked) --</option>
+                                    {otherScopeIds.map(id => {
+                                        const scopeTitle = allScopes.find(s => s.id === id)?.title;
+                                        return (
+                                            <option key={id} value={id}>
+                                                {scopeTitle}
+                                            </option>
+                                        );
+                                    })}
+                                </select>
+                                <p className="text-xs text-indigo-600 mt-1">Links this abatement item to a dependent scope.</p>
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Right Column: Actions List */}
+                    <div className="md:col-span-1 space-y-2">
+                        <div className="flex justify-between items-center border-b pb-2">
+                            <h4 className="text-sm font-bold text-gray-800">Action Items ({part.actions.length})</h4>
+                            <button onClick={handleAddAction} className="text-green-600 hover:text-green-700 transition flex items-center text-xs font-semibold">
+                                <Plus size={16} className="mr-1" /> Add
+                            </button>
+                        </div>
+                        
+                        <div className="max-h-36 overflow-y-auto pr-1 space-y-1">
+                            {part.actions.map(action => (
+                                <div 
+                                    key={action.id} 
+                                    className={`flex justify-between items-center p-2 rounded-lg transition ${isLeadAbatementScope ? 'bg-indigo-50 hover:bg-indigo-100 cursor-pointer' : 'bg-gray-50 hover:bg-gray-100 cursor-pointer'}`}
+                                    onClick={() => handleActionClick(action)}
+                                >
+                                    {isLeadAbatementScope ? (
+                                        // Simple checkbox for Lead Abatement
+                                        <label className="flex items-center flex-grow text-sm font-medium text-gray-700 cursor-pointer">
+                                            <input 
+                                                type="checkbox" 
+                                                checked={action.percentComplete === 100} 
+                                                onChange={() => handleActionToggle(action.id)} 
+                                                className="form-checkbox h-4 w-4 text-green-600 rounded"
+                                                onClick={(e) => e.stopPropagation()} // Stop propagation to prevent modal logic
+                                            />
+                                            <span className={`ml-2 ${action.percentComplete === 100 ? 'line-through text-gray-500' : ''}`}>
+                                                {action.title}
+                                            </span>
+                                        </label>
+                                    ) : (
+                                        // Complex action with progress for standard scopes
+                                        <div className="flex-grow text-sm font-medium text-gray-700 truncate">
+                                            {action.title}
+                                            <span className="text-xs font-semibold text-indigo-500 ml-2">
+                                                ({action.percentComplete}%)
+                                            </span>
+                                        </div>
+                                    )}
+                                    
+                                    <button onClick={(e) => { e.stopPropagation(); handleDeleteAction(action.id); }} className="text-red-400 hover:text-red-600 p-1 rounded-full transition ml-2">
+                                        <Trash2 size={14} />
                                     </button>
                                 </div>
                             ))}
                         </div>
-
-                        {/* Add New Step */}
-                        <div className="flex mt-3 space-x-2">
-                            <input
-                                type="text"
-                                placeholder="Add new step..."
-                                value={newStep}
-                                onChange={(e) => setNewStep(e.target.value)}
-                                onKeyDown={(e) => e.key === 'Enter' && handleAddStep()}
-                                className="flex-1 p-2 border rounded-lg text-sm focus:ring-blue-500 focus:border-blue-500"
-                            />
-                            <button onClick={handleAddStep} className="bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700 transition">
-                                <Plus className="w-5 h-5" />
-                            </button>
-                        </div>
                     </div>
-                    
-                    {/* Notes Section */}
-                    <div>
-                        <h4 className="font-bold text-gray-800 mb-2">Notes</h4>
-                        <textarea
-                            value={currentAction.notes}
-                            onChange={(e) => setCurrentAction(prev => ({ ...prev, notes: e.target.value, lastUpdated: new Date() }))}
-                            placeholder="Add detailed notes or observations..."
-                            rows="3"
-                            className="w-full p-2 text-sm border rounded-lg focus:ring-blue-500 focus:border-blue-500 transition bg-white"
-                        />
-                    </div>
-
-                    {/* Image Attachment */}
-                    <div className="border p-4 rounded-lg bg-gray-50">
-                        <h4 className="font-bold text-gray-800 mb-2 flex items-center">
-                            <Image className="w-4 h-4 mr-2 text-purple-600"/> Image Attachment
-                        </h4>
-                        <input
-                            type="file"
-                            accept="image/jpeg,image/png,image/jpg"
-                            onChange={handleImageUpload}
-                            id="image-upload-input"
-                            className="hidden"
-                        />
-                        <label htmlFor="image-upload-input" className="cursor-pointer bg-purple-600 text-white p-3 rounded-lg flex items-center justify-center hover:bg-purple-700 transition shadow-md">
-                            <Upload className="w-5 h-5 mr-2"/> {tempImage && tempImage.dataURL ? `Replace Image: ${tempImage.name}` : 'Upload Image (JPG/PNG)'}
-                        </label>
-                        {tempImage && tempImage.dataURL && (
-                            <div className="mt-3 p-3 bg-white border rounded-lg">
-                                <p className="text-sm font-medium text-gray-700 truncate">{tempImage.name}</p>
-                                <img src={tempImage.dataURL} alt="Attachment Preview" className="mt-2 w-full h-40 object-contain border rounded-md" />
-                                <p className="text-xs text-red-500 mt-2">
-                                    <span className='font-bold'>Note:</span> This image is displayed using local data (Base64) and <span className='font-bold'>will not persist</span> if you refresh the page or view on another device, due to Firestore document size limits.
-                                </p>
-                            </div>
-                        )}
-                         {tempImage && !tempImage.dataURL && (
-                            <div className="mt-3 p-3 bg-white border rounded-lg">
-                                <p className="text-sm font-medium text-gray-700 truncate">Image Placeholder: {tempImage.name}</p>
-                                <p className="text-xs text-gray-500 mt-2">Image metadata is saved, but the file content is not stored in Firestore. Re-upload is required to preview after refresh.</p>
-                            </div>
-                        )}
-                    </div>
-                </div>
-
-                {/* Modal Footer */}
-                <div className="p-4 border-t flex justify-end sticky bottom-0 bg-white rounded-b-xl">
-                    <button 
-                        onClick={handleSave} 
-                        className="bg-green-600 text-white p-3 rounded-lg font-semibold hover:bg-green-700 transition shadow-lg"
-                    >
-                        Save & Close Action
-                    </button>
                 </div>
             </div>
         </div>
@@ -695,1043 +1017,548 @@ const ActionModal = ({ action, scope, drawing, onClose, updateScopeData }) => {
 };
 
 
-// --- CORE COMPONENTS ---
-
-const Header = ({ currentTitle, toggleSidebar }) => (
-  <header className="bg-gray-900 text-white p-4 shadow-xl flex justify-between items-center fixed top-0 w-full z-40">
-    <div className="flex items-center">
-      <button onClick={toggleSidebar} className="p-2 mr-3 rounded-lg hover:bg-gray-700 transition">
-        <Menu className="w-6 h-6" />
-      </button>
-      <h1 className="text-xl font-extrabold font-inter truncate text-green-400">{currentTitle}</h1>
-    </div>
-    <div className="flex items-center space-x-2">
-      <div className="hidden sm:block text-xs text-gray-400">Public User ID:</div>
-      <Settings className="w-5 h-5 text-gray-500"/>
-    </div>
-  </header>
-);
-
-const Sidebar = ({ isOpen, toggleSidebar, navItems, currentPage, setCurrentPage, userId }) => {
-  const baseClasses = "fixed inset-y-0 left-0 transform bg-gray-800 text-white w-64 p-4 z-50 transition-transform duration-300 shadow-2xl overflow-y-auto";
-  const finalClasses = isOpen ? baseClasses : `${baseClasses} -translate-x-full`;
-
-  const handleNavClick = (page) => {
-    setCurrentPage(page);
-    toggleSidebar();
-  };
-
-  return (
-    <>
-      {/* Backdrop */}
-      {isOpen && (
-        <div className="fixed inset-0 bg-black opacity-50 z-40" onClick={toggleSidebar}></div>
-      )}
-
-      {/* Sidebar */}
-      <div className={finalClasses}>
-        <div className="flex justify-between items-center mb-6 border-b border-gray-700 pb-3">
-          <h2 className="text-2xl font-extrabold text-green-400">MCR4 TMODs</h2>
-          <button onClick={toggleSidebar} className="p-1 rounded-full hover:bg-gray-700">
-            <X className="w-5 h-5 text-gray-500"/>
-          </button>
-        </div>
-
-        <nav className="space-y-2">
-          {navItems.map((item) => (
-            <button
-              key={item}
-              onClick={() => handleNavClick(item)}
-              className={`w-full text-left p-3 rounded-xl transition duration-150 flex items-center ${
-                currentPage === item
-                  ? 'bg-green-600 font-bold shadow-lg'
-                  : 'hover:bg-gray-700 text-gray-300'
-              }`}
-            >
-              {item === 'MCR4 TMODs Summary' ? <LayoutDashboard className="w-5 h-5 mr-3"/> : <Settings className="w-5 h-5 mr-3"/>}
-              {item}
-            </button>
-          ))}
-        </nav>
-
-        <div className="mt-auto pt-6 border-t border-gray-700 absolute bottom-0 left-0 right-0 p-4">
-          <p className="text-xs text-gray-500">
-            User ID: <span className="font-mono break-all text-gray-400">{userId || 'Loading...'}</span>
-          </p>
-        </div>
-      </div>
-    </>
-  );
-};
-
-const PrereqSection = ({ scope, updateScopeData, allScopes }) => {
-  const [selectedPrereqKey, setSelectedPrereqKey] = useState(null);
-  const prereqData = scope.prereqs;
-  const prereqKeys = Object.keys(prereqData);
-  const statusOptions = ['Not Started', 'In Progress', 'Complete', 'N/A'];
-
-  const handleStatusChange = (key, newStatus) => {
-    // Only allow changes for Materials and General Prereqs
-    if (key === 'leadAbatement') return; 
-
-    const currentData = prereqData[key];
+// Renders the main content for any given scope page
+const ScopePage = ({ scope, updateScopeData, allScopes, setCurrentPage }) => {
+    // Determine if this is the special Lead Abatement page
+    const isLeadAbatementScope = scope.id === 'lead_abatement';
     
-    // Determine if we're dealing with a simple string status (legacy/Lead Abatement) or an object
-    const updatedPrereq = isStepPrereq(key) 
-        ? { ...currentData, status: newStatus }
-        : newStatus; 
+    // Get all other scope IDs for the Lead Abatement picker
+    const nonSummaryAndSelfScopes = allScopes.filter(s => s.type === 'scope' && s.id !== scope.id);
+    const otherScopeIds = nonSummaryAndSelfScopes.map(s => s.id);
 
-    const newPrereqs = { ...prereqData, [key]: updatedPrereq };
-    updateScopeData(scope.id, { ...scope, prereqs: newPrereqs });
-  };
-  
-  const getDisplayStatus = (key) => {
-      const data = prereqData[key];
-      
-      // NEW LOGIC: If it's Lead Abatement AND we are NOT on the Lead Abatement page:
-      if (key === 'leadAbatement' && scope.id !== LEAD_ABATEMENT_ID) {
-          const { percent, linkedItemsCount } = getLeadAbatementProgressForScope(allScopes, scope.id);
-          
-          if (linkedItemsCount === 0) return 'N/A';
-          if (percent === 100) return 'Complete';
-          if (percent > 0) return 'In Progress';
-          
-          return 'Not Started'; // 0% complete but items are linked
-      }
-      
-      return typeof data === 'string' ? data : data.status;
-  };
+    // Filter out the summary scope for calculations
+    const nonSummaryScopes = allScopes.filter(s => s.type === 'scope');
 
-  const getStepProgress = (key) => {
-      const data = prereqData[key];
-      if (isStepPrereq(key) && data && data.steps) {
-          const percent = calculatePercentFromSteps(data.steps);
-          
-          return (
-              <div className="flex items-center text-xs ml-4 space-x-2 cursor-pointer text-blue-600 hover:underline">
-                  <div className="w-12 h-1.5 bg-gray-300 rounded-full">
-                      <div className="h-1.5 rounded-full transition-all duration-500" style={{ width: `${percent}%`, backgroundColor: percent === 100 ? '#10B981' : (percent > 0 ? '#F59E0B' : '#EF4444') }}></div>
-                  </div>
-                  <span>{percent}%</span>
-              </div>
-          );
-      }
-      return null;
-  };
+    // --- Prerequisite Section Handlers ---
+    const [modalOpen, setModalOpen] = useState(false);
+    const [selectedPrereqKey, setSelectedPrereqKey] = useState(null);
+    
+    const openPrereqModal = (key) => {
+        setSelectedPrereqKey(key);
+        setModalOpen(true);
+    };
 
-  return (
-    <section className="mt-6 p-6 bg-white shadow-xl rounded-xl">
-      {selectedPrereqKey && (
-          <PrereqModal
-              prereqKey={selectedPrereqKey}
-              prereqData={prereqData[selectedPrereqKey]}
-              scope={scope}
-              onClose={() => setSelectedPrereqKey(null)}
-              updateScopeData={updateScopeData}
-          />
-      )}
+    // Calculate Lead Abatement progress from linked items
+    const leadAbatementProgress = useMemo(() => {
+        if (isLeadAbatementScope) return { percent: 100, isLinked: true }; // N/A, but forced to 100 to show 'N/A' status
+        return getLeadAbatementProgressForScope(scope.id, nonSummaryScopes);
+    }, [scope.id, nonSummaryScopes, isLeadAbatementScope]);
 
-      <h2 className="text-2xl font-bold mb-4 text-gray-800 border-b pb-2">Prerequisite Status</h2>
-      <div className="space-y-4">
-        {prereqKeys.map((key) => {
-          const displayStatus = getDisplayStatus(key);
-          const isTrackableItem = isStepPrereq(key);
-          const isExternalLeadAbatement = key === 'leadAbatement' && scope.id !== LEAD_ABATEMENT_ID; // New flag
 
-          // Render button for step-based items, or just the label for dropdown-only
-          const PrereqLabel = (
-            <label className="capitalize font-semibold text-gray-700 mb-1 sm:mb-0">
-              {key.replace(/([A-Z])/g, ' $1').trim()}
-            </label>
-          );
-          
-          return (
-            <div 
-              key={key} 
-              className={`flex flex-col sm:flex-row justify-between items-start sm:items-center p-4 border-l-8 rounded-lg transition duration-150 shadow-sm ${isTrackableItem && !isExternalLeadAbatement ? 'cursor-pointer hover:bg-gray-100 bg-gray-50' : 'bg-white'}`} 
-              style={{borderColor: getStatusColor(displayStatus).match(/border-(\w+-\d+)/)?.[1] || 'gray-300'}}
-              onClick={isTrackableItem && !isExternalLeadAbatement ? () => setSelectedPrereqKey(key) : undefined}
-            >
-              <div className="flex items-center">
-                  {PrereqLabel}
-                  {isTrackableItem && getStepProgress(key)}
-                  
-                  {/* NEW: Display external progress for Lead Abatement */}
-                  {isExternalLeadAbatement && (() => {
-                      const { percent, linkedItemsCount } = getLeadAbatementProgressForScope(allScopes, scope.id);
-                      
-                      if (linkedItemsCount === 0) {
-                          return <span className="ml-4 text-xs font-medium text-gray-500">(No abatement items linked)</span>;
-                      }
+    const handlePrereqDropdownChange = (key, value) => {
+        // Only updates the Lead Abatement status dropdown on non-Lead Abatement pages
+        if (key === 'prereqStatusLeadAbatement' && !isLeadAbatementScope) return;
 
-                      return (
-                          <div className="flex items-center text-xs ml-4 space-x-2">
-                              <div className="w-12 h-1.5 bg-gray-300 rounded-full">
-                                  <div className="h-1.5 rounded-full transition-all duration-500" style={{ width: `${percent}%`, backgroundColor: percent === 100 ? '#10B981' : (percent > 0 ? '#F59E0B' : '#EF4444') }}></div>
-                              </div>
-                              <span className='font-bold text-gray-700'>{percent}%</span>
-                              <span className='text-gray-500'>(Linked Abatement Progress)</span>
-                          </div>
-                      );
-                  })()}
-              </div>
-              
-              <div className="relative inline-block w-full sm:w-auto flex items-center space-x-2">
-                {/* Status Display: Read-only derived status for external Lead Abatement */}
-                {isExternalLeadAbatement ? (
-                    <span className={`block w-full py-2 px-3 text-sm border rounded-lg transition font-semibold text-center shadow-inner ${getStatusColor(displayStatus)}`}>
-                        {displayStatus}
-                    </span>
-                ) : (
-                    // Existing Select Dropdown for local/step prereqs
-                    <select
-                        value={displayStatus}
-                        onChange={(e) => handleStatusChange(key, e.target.value)}
-                        className={`appearance-none block w-full py-2 pl-3 pr-10 text-sm border rounded-lg focus:ring-2 focus:ring-blue-500 cursor-pointer transition shadow-inner ${getStatusColor(displayStatus)}`}
-                        disabled={isTrackableItem}
-                    >
-                        {statusOptions.map(option => (
-                            <option key={option} value={option}>{option}</option>
-                        ))}
-                    </select>
-                )}
+        updateScopeData(scope.id, { ...scope, [key]: value });
+    };
+
+    const handleAddPart = () => {
+        const newPart = createDefaultPart();
+        updateScopeData(scope.id, { ...scope, parts: [...scope.parts, newPart] });
+    };
+
+    // --- Report Export Function ---
+    const handleExport = () => {
+        const printWindow = window.open('', '', 'height=800,width=800');
+        printWindow.document.write('<html><head><title>MCR4 TMOD Report</title>');
+        printWindow.document.write('<style>');
+        printWindow.document.write(`
+            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+            body { font-family: 'Inter', sans-serif; margin: 0; padding: 20px; background-color: #ffffff; }
+            h1 { color: #1f2937; border-bottom: 3px solid #6366f1; padding-bottom: 10px; margin-bottom: 25px; }
+            h2 { color: #374151; border-bottom: 1px solid #e5e7eb; padding-bottom: 8px; margin-top: 30px; margin-bottom: 15px; }
+            .part-card { border: 2px solid #e5e7eb; border-radius: 8px; margin-bottom: 25px; padding: 15px; page-break-inside: avoid; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+            .part-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+            .part-title { font-size: 1.1rem; font-weight: bold; }
+            .status { font-weight: bold; padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; }
+            .status.notstarted { background-color: #fca5a5; color: #b91c1c; } /* red-300 */
+            .status.inprogress { background-color: #fde68a; color: #b45309; } /* yellow-300 */
+            .status.complete { background-color: #a7f3d0; color: #065f46; } /* green-300 */
+            .progress-bar-container { background-color: #e5e7eb; border-radius: 5px; height: 10px; margin-top: 5px; }
+            .progress-bar { height: 100%; border-radius: 5px; transition: width 0.5s; }
+            .bg-green-600 { background-color: #059669; }
+            .bg-yellow-500 { background-color: #f59e0b; }
+            .bg-red-500 { background-color: #ef4444; }
+            .progress-percent { font-size: 0.9rem; margin-top: 5px; text-align: right; }
+            .actions-list { list-style: none; padding: 0; margin-top: 10px; }
+            .actions-list li { padding: 5px 0; border-bottom: 1px dotted #f3f4f6; font-size: 0.9rem; display: flex; justify-content: space-between; }
+            .actions-list li:last-child { border-bottom: none; }
+            .image-container { width: 150px; height: 100px; overflow: hidden; margin-right: 15px; border-radius: 4px; border: 1px solid #ddd; float: left; }
+            .image-container img { width: 100%; height: 100%; object-fit: cover; }
+        `);
+        printWindow.document.write('</style>');
+        printWindow.document.write('</head><body>');
+
+        printWindow.document.write(`<h1>TMOD Report: ${scope.title}</h1>`);
+        
+        // --- Parts Tracking Section ---
+        const partSectionTitle = isLeadAbatementScope ? 'Things needing Abating' : 'Parts Tracking';
+        printWindow.document.write(`<h2>${partSectionTitle} (${scope.parts?.length || 0})</h2>`);
+
+        if (scope.parts && scope.parts.length > 0) {
+            scope.parts.forEach(part => {
+                const percent = part.percentComplete || 0;
+                const statusLabel = getStatusLabel(percent);
+                const statusClass = statusLabel.toLowerCase().replace(' ', '');
+                const colorClass = getStatusColor(percent).replace('bg-', 'bg-');
+
+                let actionsListHtml = '';
+                if (part.actions) {
+                    part.actions.forEach(action => {
+                        const actionPercent = action.percentComplete || 0;
+                        const actionStatus = actionPercent === 100 ? ' (Complete)' : actionPercent > 0 ? ` (${actionPercent}%)` : '';
+                        actionsListHtml += `<li><span>${action.title}</span><span style="font-weight: 500;">${actionStatus}</span></li>`;
+                    });
+                }
                 
-                {/* Chevron icon for dropdown/modal trigger */}
-                {(!isExternalLeadAbatement && !isTrackableItem) && <ChevronDown className="pointer-events-none w-4 h-4 absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-600"/>}
+                // Since images are session-only, this is primarily for structural completeness.
+                const imageHtml = part.imageUrl ? 
+                    `<div class="image-container"><img src="${part.imageUrl}" alt="Part Image" /></div>` : 
+                    `<div class="image-container" style="display:flex; align-items:center; justify-content:center; background-color:#f0f0f0; color:#999; font-size:10px;">No Image</div>`;
 
-                {/* Edit button for local step prereqs (Materials/General) */}
-                {isTrackableItem && !isExternalLeadAbatement && (
+                printWindow.document.write(`
+                    <div class="part-card">
+                        <div class="part-header">
+                            <div class="part-title">${part.title}</div>
+                            <span class="status ${statusClass}">${statusLabel}</span>
+                        </div>
+                        
+                        <div style="clear: both;">
+                            ${imageHtml}
+                            <div style="margin-left: 175px;">
+                                <div class="progress-bar-container">
+                                    <div class="progress-bar ${colorClass}" style="width: ${percent}%;"></div>
+                                </div>
+                                <div class="progress-percent">${percent}% Complete</div>
+                                
+                                <h4 style="font-size: 1rem; margin-top: 15px; margin-bottom: 5px; font-weight: bold;">Actions</h4>
+                                <ul class="actions-list">
+                                    ${actionsListHtml}
+                                </ul>
+                            </div>
+                        </div>
+                        <div style="clear: both;"></div>
+                    </div>
+                `);
+            });
+        } else {
+            printWindow.document.write('<p>No parts or items have been added to this scope yet.</p>');
+        }
+
+
+        printWindow.document.write('</body></html>');
+        printWindow.document.close();
+        
+        // Use a timeout to ensure all content is rendered before printing.
+        setTimeout(() => {
+            printWindow.print();
+            printWindow.close();
+        }, 500); 
+    };
+
+
+    return (
+        <div className="p-4 md:p-8 w-full">
+            <PrereqModal 
+                isOpen={modalOpen} 
+                onClose={() => setModalOpen(false)} 
+                prereqKey={selectedPrereqKey} 
+                scope={scope} 
+                updateScopeData={updateScopeData} 
+            />
+
+            {/* Header and Controls */}
+            <div className="flex justify-between items-center mb-6 border-b pb-4">
+                <h1 className="text-3xl font-extrabold text-gray-800">{scope.title}</h1>
+                <div className="flex space-x-3">
                     <button 
-                        onClick={(e) => { e.stopPropagation(); setSelectedPrereqKey(key); }}
-                        className="p-2 bg-blue-600 rounded-lg text-white hover:bg-blue-700 transition shadow-md flex-shrink-0 ml-2"
-                        title="Edit Steps and Notes"
+                        onClick={handleExport}
+                        className="bg-indigo-600 text-white px-4 py-2 rounded-lg font-semibold hover:bg-indigo-700 transition shadow-md flex items-center"
                     >
-                        <Edit className="w-4 h-4" />
+                        Export Report (PDF)
                     </button>
-                )}
-              </div>
+                </div>
             </div>
-          );
-        })}
-      </div>
-    </section>
-  );
+
+            {/* --- PREREQUISITE SECTION --- */}
+            {!isLeadAbatementScope && (
+                <div className="mb-8 p-6 bg-white rounded-xl shadow-lg space-y-4">
+                    <h2 className="text-2xl font-bold text-gray-700 border-b pb-2">Prerequisite Status</h2>
+
+                    {/* Prereq Row Helper Component */}
+                    {([
+                        { key: 'prereqStatusMaterials', title: 'Materials', isStepPrereq: true, isReadOnly: false },
+                        { key: 'prereqStatusGeneral', title: 'General Prereqs', isStepPrereq: true, isReadOnly: false },
+                        { key: 'prereqStatusLeadAbatement', title: 'Lead Abatement', isStepPrereq: false, isReadOnly: true },
+                    ]).map(({ key, title, isStepPrereq, isReadOnly }) => {
+                        
+                        let currentStatus = scope[key];
+                        let percent = 0;
+                        let isLinked = true;
+                        
+                        if (key === 'prereqStatusLeadAbatement' && isReadOnly) {
+                            // Lead Abatement is cross-linked
+                            const progress = leadAbatementProgress;
+                            percent = progress.percent;
+                            isLinked = progress.isLinked;
+                            currentStatus = getStatusLabel(percent);
+                        } else if (isStepPrereq) {
+                            // Materials & General are step-tracked
+                            percent = calculateStepCompletion(currentStatus?.steps);
+                            currentStatus = currentStatus?.status || 'Not Started'; // Use status from the object
+                        } else {
+                            // Default simple status
+                            currentStatus = currentStatus || 'Not Started';
+                            percent = currentStatus === 'Complete' ? 100 : currentStatus === 'In Progress' ? 50 : 0;
+                        }
+
+                        // Determine the status text based on the lead abatement link status
+                        const statusDisplay = key === 'prereqStatusLeadAbatement' && !isLinked
+                            ? 'N/A (No Abatement items linked to this scope)'
+                            : isStepPrereq 
+                            ? `${currentStatus} (${percent}%)`
+                            : currentStatus;
+
+                        return (
+                            <div key={key} className="flex items-center justify-between p-3 border-b last:border-b-0">
+                                <span className="text-lg font-medium text-gray-600">{title}</span>
+                                
+                                <div className="flex items-center space-x-3">
+                                    {/* Detailed Tracking Button/Status */}
+                                    {isStepPrereq && (
+                                        <button 
+                                            onClick={() => openPrereqModal(key)} 
+                                            className="bg-gray-200 text-gray-700 px-3 py-1 rounded-full text-sm font-semibold hover:bg-gray-300 transition"
+                                        >
+                                            Track Steps ({percent}%)
+                                        </button>
+                                    )}
+
+                                    {/* Read-Only Status Badge (Lead Abatement) */}
+                                    {isReadOnly && (
+                                        <div className={`px-3 py-1 rounded-full text-sm font-semibold ${getStatusColor(percent).replace('bg', 'bg')}`}>
+                                            {statusDisplay}
+                                        </div>
+                                    )}
+
+                                    {/* Dropdown Status (Only for simple/non-read-only) */}
+                                    {!isReadOnly && !isStepPrereq && (
+                                        <div className="relative">
+                                            <select
+                                                value={currentStatus}
+                                                onChange={(e) => handlePrereqDropdownChange(key, e.target.value)}
+                                                className="block appearance-none bg-white border border-gray-300 text-gray-700 py-2 px-4 pr-8 rounded-lg shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 text-base"
+                                            >
+                                                {['Not Started', 'In Progress', 'Complete'].map(status => (
+                                                    <option key={status} value={status}>{status}</option>
+                                                ))}
+                                            </select>
+                                            <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-700">
+                                                <ChevronDown size={16} />
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        );
+                    })}
+                </div>
+            )}
+
+            {/* --- PARTS TRACKING SECTION --- */}
+            <div className="p-6 bg-white rounded-xl shadow-lg space-y-6">
+                <div className="flex justify-between items-center border-b pb-3">
+                    <h2 className="text-2xl font-bold text-gray-700">
+                        {isLeadAbatementScope ? 'Things needing Abating' : 'Parts Tracking'} ({scope.parts?.length || 0})
+                    </h2>
+                    <button onClick={handleAddPart} className="bg-green-600 text-white px-4 py-2 rounded-lg font-semibold hover:bg-green-700 transition shadow-md flex items-center">
+                        <Plus size={18} className="mr-2" /> Add New
+                    </button>
+                </div>
+
+                <div className="grid grid-cols-1 gap-6">
+                    {scope.parts && scope.parts.map(part => (
+                        <DrawingCard 
+                            key={part.id} 
+                            part={part} 
+                            scope={scope} 
+                            updateScopeData={updateScopeData} 
+                            allScopes={nonSummaryAndSelfScopes}
+                            isLeadAbatementScope={isLeadAbatementScope}
+                            otherScopeIds={otherScopeIds}
+                        />
+                    ))}
+                    {(!scope.parts || scope.parts.length === 0) && (
+                        <p className="text-center text-gray-500 p-8 border border-dashed rounded-lg">Click "Add New" to start tracking parts for this scope.</p>
+                    )}
+                </div>
+            </div>
+        </div>
+    );
 };
 
-const ActionList = ({ drawing, scope, updateScopeData, openModal, isAbatement = false }) => {
-  const [newActionDescription, setNewActionDescription] = useState('');
 
-  const addAction = () => {
-    if (newActionDescription.trim()) {
-      const newAction = {
-        id: crypto.randomUUID(),
-        description: newActionDescription.trim(),
-        percentComplete: 0,
-        notes: '',
-        // Abatement actions always start with a single step for simple checkmark functionality
-        steps: [{ id: crypto.randomUUID(), description: isAbatement ? 'Abatement Action Complete?' : 'Define the scope and steps', isComplete: false }],
-        imageAttachment: null,
-        lastUpdated: new Date(),
-      };
-
-      const newDrawings = scope.drawings.map(d => {
-        if (d.id === drawing.id) {
-          return { ...d, actions: [...d.actions, newAction] };
-        }
-        return d;
-      });
-
-      updateScopeData(scope.id, { ...scope, drawings: newDrawings });
-      setNewActionDescription('');
-    }
-  };
-
-  const deleteAction = (actionId) => {
-    const newDrawings = scope.drawings.map(d => {
-      if (d.id === drawing.id) {
-        return {
-          ...d,
-          actions: d.actions.filter(a => a.id !== actionId)
-        };
-      }
-      return d;
+// Renders the main summary page
+const SummaryPage = ({ scopes, setCurrentPage }) => {
+    const nonSummaryScopes = scopes.filter(s => s.type === 'scope');
+    const totalScopes = nonSummaryScopes.length;
+    
+    // Calculate total project progress
+    const overallCompletionPercent = calculateOverallCompletion(nonSummaryScopes);
+    
+    const scopeDataWithProgress = nonSummaryScopes.map(scope => {
+        const percent = calculateOverallCompletion(scope.parts);
+        return { ...scope, percent };
     });
-    updateScopeData(scope.id, { ...scope, drawings: newDrawings });
-  };
-  
-  // Function to handle simple checkbox update (only for abatement)
-  const toggleAbatementAction = (actionId) => {
-      const newDrawings = scope.drawings.map(d => {
-          if (d.id === drawing.id) {
-              return {
-                  ...d,
-                  actions: d.actions.map(a => {
-                      if (a.id === actionId) {
-                          // Toggle the completion of the *first* (and only) step
-                          const updatedSteps = a.steps.map((step, index) => 
-                              index === 0 ? { ...step, isComplete: !step.isComplete } : step
-                          );
-                          return { 
-                              ...a, 
-                              steps: updatedSteps, 
-                              lastUpdated: new Date() 
-                          };
-                      }
-                      return a;
-                  })
-              };
-          }
-          return d;
-      });
-      updateScopeData(scope.id, { ...scope, drawings: newDrawings });
-  };
 
+    return (
+        <div className="p-4 md:p-8 w-full space-y-8">
+            <h1 className="text-3xl font-extrabold text-gray-800 border-b pb-4">Project Overview</h1>
 
-  return (
-    <div className="space-y-4">
-      <div className="flex flex-col space-y-3">
-        <input
-          type="text"
-          placeholder={isAbatement ? "New abatement action description..." : "New action description..."}
-          value={newActionDescription}
-          onChange={(e) => setNewActionDescription(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && addAction()}
-          className="p-3 border border-gray-300 rounded-xl focus:ring-blue-500 focus:border-blue-500 shadow-inner transition"
-        />
-        <button
-          onClick={addAction}
-          className="bg-blue-600 text-white p-3 rounded-xl font-semibold hover:bg-blue-700 transition duration-150 flex items-center justify-center shadow-lg"
-        >
-          <Plus className="w-5 h-5 mr-2" /> {isAbatement ? 'Add Abatement Item' : 'Add Action Item'}
-        </button>
-      </div>
-      
-      {/* Abatement Checkbox View (Simplified) */}
-      {isAbatement && (
-        <div className="space-y-3">
-            {drawing.actions.map((action) => {
-                const percent = calculatePercentFromSteps(action.steps);
-                const isComplete = percent === 100;
-
-                return (
-                    <div 
-                        key={action.id} 
-                        className={`bg-white p-4 rounded-xl shadow-md border ${isComplete ? 'border-green-400 bg-green-50' : 'border-gray-300 hover:border-red-400 bg-gray-50'} flex items-center justify-between transition`}
-                    >
-                        <div className='flex items-center flex-1 pr-4 cursor-pointer' onClick={() => toggleAbatementAction(action.id)}>
-                            <input
-                                type="checkbox"
-                                checked={isComplete}
-                                onChange={() => toggleAbatementAction(action.id)}
-                                // This is disabled because the parent div handles the click, but we need it for mobile touch
-                                className="h-6 w-6 text-green-600 rounded border-gray-300 focus:ring-green-500 cursor-pointer flex-shrink-0"
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                {/* 1. Overall Completion Ring */}
+                <div className="lg:col-span-1 bg-white p-6 rounded-xl shadow-lg flex flex-col items-center">
+                    <h2 className="text-xl font-bold text-gray-700 mb-4 border-b pb-2 w-full text-center">TMODs Completion</h2>
+                    
+                    {/* Ring Chart */}
+                    <div className="relative w-48 h-48 my-4">
+                        <svg className="w-full h-full transform -rotate-90" viewBox="0 0 100 100">
+                            {/* Background track */}
+                            <circle
+                                cx="50"
+                                cy="50"
+                                r="45"
+                                fill="transparent"
+                                stroke="#e5e7eb"
+                                strokeWidth="10"
                             />
-                            <span className={`ml-3 font-medium text-gray-800 flex-1 ${isComplete ? 'line-through text-gray-500' : ''}`}>
-                                {action.description}
+                            {/* Progress bar */}
+                            <circle
+                                cx="50"
+                                cy="50"
+                                r="45"
+                                fill="transparent"
+                                stroke="currentColor"
+                                strokeWidth="10"
+                                strokeDasharray={2 * Math.PI * 45}
+                                strokeDashoffset={2 * Math.PI * 45 * (1 - overallCompletionPercent / 100)}
+                                className={getTextColor(overallCompletionPercent)}
+                            />
+                        </svg>
+                        <div className="absolute inset-0 flex flex-col items-center justify-center">
+                            <span className="text-5xl font-extrabold text-gray-800">
+                                {overallCompletionPercent}%
+                            </span>
+                            <span className="text-sm font-medium text-gray-500 mt-1">
+                                {totalScopes} Scopes
                             </span>
                         </div>
-                        <button onClick={(e) => { e.stopPropagation(); deleteAction(action.id); }} className="text-red-500 hover:text-red-700 p-1 rounded-full transition flex-shrink-0" title="Delete Abatement Item">
-                            <Trash2 className="w-4 h-4" />
-                        </button>
-                    </div>
-                );
-            })}
-        </div>
-      )}
-
-      {/* Standard Modal View (Non-Abatement Scopes) */}
-      {!isAbatement && (
-          <div className="space-y-3">
-            {drawing.actions.map((action) => {
-                const percent = calculatePercentFromSteps(action.steps);
-                let icon = <Clock className="w-4 h-4 text-white" />;
-                let bgColor = 'red';
-                if (percent === 100) { icon = <CheckCircle className="w-4 h-4 text-white" />; bgColor = 'green'; }
-                else if (percent > 0) { bgColor = 'orange'; }
-
-                return (
-                  <div 
-                      key={action.id} 
-                      className="bg-white p-4 rounded-xl shadow-md border border-gray-200 cursor-pointer hover:shadow-lg transition"
-                      onClick={() => openModal(action)}
-                  >
-                    <div className="flex justify-between items-start mb-2">
-                      <span className="font-medium text-gray-800 pr-4">{action.description}</span>
-                      <button onClick={(e) => { e.stopPropagation(); deleteAction(action.id); }} className="text-red-500 hover:text-red-700 p-1 rounded-full transition flex-shrink-0">
-                        <Trash2 className="w-4 h-4" />
-                      </button>
                     </div>
                     
-                    {/* Progress bar and status */}
-                    <div className="flex items-center space-x-4">
-                        <div className="flex-1">
-                            <div className="w-full bg-gray-300 rounded-full h-2.5">
-                                <div className="h-2.5 rounded-full transition-all duration-500" style={{ width: `${percent}%`, backgroundColor: percent === 100 ? '#10B981' : (percent > 0 ? '#F59E0B' : '#EF4444') }}></div>
+                    <StatusBadge percent={overallCompletionPercent} />
+                </div>
+
+                {/* 2. Scope Breakdown Table/Chart */}
+                <div className="lg:col-span-2 bg-white p-6 rounded-xl shadow-lg">
+                    <h2 className="text-xl font-bold text-gray-700 mb-4 border-b pb-2">Scope Breakdown</h2>
+                    
+                    <div className="space-y-3">
+                        {scopeDataWithProgress.map(scope => (
+                            <div 
+                                key={scope.id} 
+                                className="flex items-center justify-between p-3 bg-gray-50 rounded-lg shadow-sm border border-transparent transition duration-200 hover:shadow-md hover:border-indigo-300 cursor-pointer"
+                                onClick={() => setCurrentPage(scope.id)}
+                            >
+                                <span className="text-lg font-medium text-gray-700 w-2/5 truncate">
+                                    {scope.title}
+                                </span>
+                                <div className="flex items-center space-x-4">
+                                    <StatusBadge percent={scope.percent} readOnly={true} />
+                                    <MiniCircularProgress percent={scope.percent} />
+                                </div>
                             </div>
-                        </div>
-                        <div className="text-sm font-bold w-10 text-right text-gray-700">{percent}%</div>
-                        <div className="w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 shadow-md" style={{ backgroundColor: bgColor }}>
-                            {icon}
-                        </div>
+                        ))}
                     </div>
-
-                    <div className="flex justify-between items-center mt-3 border-t pt-2">
-                        <span className="text-xs text-gray-400">
-                            {action.steps?.length || 0} Steps | Click to view details
-                        </span>
-                        <span className="text-xs text-blue-500 font-medium hover:underline">
-                            Last Update: {timeConverter(action.lastUpdated)}
-                        </span>
-                    </div>
-                  </div>
-                );
-            })}
-          </div>
-      )}
-    </div>
-  );
-};
-
-const DrawingCard = ({ drawing, scope, updateScopeData, isLeadAbatement, relatedScopes }) => {
-  const [isActionsOpen, setIsActionsOpen] = useState(false);
-  const [isRenaming, setIsRenaming] = useState(false);
-  const [newName, setNewName] = useState(drawing.name);
-  const [selectedAction, setSelectedAction] = useState(null);
-  // NEW STATE for holding temporary Base64 string for display only
-  const [localImageUrl, setLocalImageUrl] = useState(null); 
-
-  const status = useMemo(() => getDrawingStatus(drawing.actions), [drawing.actions]);
-
-  let statusIcon, statusText;
-  switch (status) {
-    case 'green':
-      statusIcon = <CheckCircle className="w-8 h-8 text-green-500" />;
-      statusText = 'Complete';
-      break;
-    case 'yellow':
-      statusIcon = <Clock className="w-8 h-8 text-yellow-500" />;
-      statusText = 'In Progress';
-      break;
-    case 'red':
-    default:
-      statusIcon = <XCircle className="w-8 h-8 text-red-500" />;
-      statusText = 'Not Started';
-  }
-
-  const handleRename = () => {
-    if (newName.trim() && newName !== drawing.name) {
-        const newDrawings = scope.drawings.map(d => 
-            d.id === drawing.id ? { ...d, name: newName.trim() } : d
-        );
-        updateScopeData(scope.id, { ...scope, drawings: newDrawings });
-    }
-    setIsRenaming(false);
-  };
-
-  const handleImageUpload = (e) => {
-    const file = e.target.files[0];
-    if (file && file.type.startsWith('image/')) {
-        const reader = new FileReader();
-        reader.onload = (event) => {
-            // DO NOT update Firestore data here. Only update local state for display.
-            setLocalImageUrl(event.target.result); 
-        };
-        reader.readAsDataURL(file);
-    }
-  };
-
-  const handleRelatedScopeChange = (e) => {
-    const newRelatedScopeId = e.target.value;
-    const newDrawings = scope.drawings.map(d => 
-        d.id === drawing.id ? { ...d, relatedScopeId: newRelatedScopeId } : d
+                </div>
+            </div>
+        </div>
     );
-    updateScopeData(scope.id, { ...scope, drawings: newDrawings });
-  };
-  
-  // Use local state if an image was just uploaded, otherwise use the (empty) persisted URL
-  const imageSource = localImageUrl || drawing.imageUrl; 
-
-  return (
-    <div className={`border-4 rounded-xl shadow-xl transition-all duration-300 ${getStatusBorder(status)} bg-white p-6`}>
-      {/* Action Modal is only rendered for non-abatement scopes */}
-      {selectedAction && !isLeadAbatement && (
-          <ActionModal
-              action={selectedAction}
-              scope={scope}
-              drawing={drawing}
-              onClose={() => setSelectedAction(null)}
-              updateScopeData={updateScopeData}
-          />
-      )}
-
-      {/* Header Row */}
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-4 pb-4 border-b border-gray-200">
-        <div className="flex items-center space-x-3 mb-2 sm:mb-0">
-          <div className="w-10 h-10 flex-shrink-0">{statusIcon}</div>
-          <div className="flex items-center">
-            {isRenaming ? (
-                <input
-                    type="text"
-                    value={newName}
-                    onChange={(e) => setNewName(e.target.value)}
-                    onBlur={handleRename}
-                    onKeyDown={(e) => e.key === 'Enter' && handleRename()}
-                    className="text-2xl font-bold text-gray-800 border-b border-blue-500 focus:outline-none bg-gray-50 p-1 rounded"
-                    autoFocus
-                />
-            ) : (
-                <h3 className="text-2xl font-bold text-gray-800">{drawing.name}</h3>
-            )}
-            <button 
-                onClick={() => setIsRenaming(true)} 
-                className="ml-2 text-gray-400 hover:text-blue-600 transition p-1 rounded-full"
-                title="Rename Part"
-            >
-                <Edit className="w-5 h-5"/>
-            </button>
-          </div>
-        </div>
-        <div className={`text-sm font-bold p-2 px-4 rounded-full min-w-[120px] text-center shadow-inner border ${getStatusColor(statusText)}`}>
-          {statusText}
-        </div>
-      </div>
-
-      {/* Related Scope Identifier (ONLY for Lead Abatement) */}
-      {isLeadAbatement && (
-          <div className="mt-4 mb-6 p-4 bg-indigo-50 rounded-xl border border-indigo-300 shadow-inner">
-              <label htmlFor={`related-scope-${drawing.id}`} className="text-sm font-semibold text-indigo-700 block mb-2">
-                  Relates to Scope:
-              </label>
-              <div className="relative">
-                  <select
-                      id={`related-scope-${drawing.id}`}
-                      value={drawing.relatedScopeId || 'N/A'}
-                      onChange={handleRelatedScopeChange}
-                      className="appearance-none block w-full py-2 pl-3 pr-10 text-sm border rounded-lg focus:ring-blue-500 focus:border-blue-500 cursor-pointer bg-white shadow-sm"
-                  >
-                      <option value="N/A" disabled>Select Related Scope</option>
-                      {relatedScopes.map(name => {
-                          const id = name.toLowerCase().replace(/[^a-z0-9]+/g, '_');
-                          return <option key={id} value={id}>{name}</option>;
-                      })}
-                  </select>
-                  <ChevronDown className="pointer-events-none w-4 h-4 absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-600"/>
-              </div>
-              <p className='text-xs text-indigo-500 mt-1'>Links this abatement item to the modification scope it is supporting.</p>
-          </div>
-      )}
-
-
-      {/* Drawing Placeholder and Actions */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        
-        {/* Image/Upload Section - 1/3 width on desktop */}
-        <div className="lg:col-span-1 p-4 rounded-xl flex flex-col items-center justify-center border-dashed border-2 min-h-[180px] overflow-hidden transition" 
-             style={{ borderColor: getStatusBorder(status).replace('border-', '#') }}
-        >
-            <input
-                type="file"
-                accept="image/jpeg"
-                onChange={handleImageUpload}
-                id={`part-image-upload-${drawing.id}`}
-                className="hidden"
-            />
-            {imageSource ? (
-                <>
-                <img src={imageSource} alt="Part Visual" className="w-full h-full object-contain rounded-lg" />
-                <label htmlFor={`part-image-upload-${drawing.id}`} className="mt-2 w-full text-center cursor-pointer text-sm font-medium text-blue-600 p-2 border-t border-gray-100 hover:text-blue-700 transition">
-                    Click to Replace Image
-                </label>
-                </>
-            ) : (
-                <label htmlFor={`part-image-upload-${drawing.id}`} className="cursor-pointer text-gray-500 text-center text-sm p-4 w-full h-full flex flex-col items-center justify-center hover:bg-gray-100 transition">
-                    <Upload className="w-6 h-6 mb-2 text-gray-400"/>
-                    <span className='font-semibold'>Upload Part Image (JPG)</span>
-                    <p className={`mt-2 text-xs font-mono p-1 rounded ${getStatusColor(statusText)} border`}>
-                        Status: {statusText}
-                    </p>
-                </label>
-            )}
-            
-            {/* Display local-only warning clearly */}
-             {(localImageUrl || drawing.imageUrl) && (
-                <p className="text-xs text-red-500 mt-2 p-1 bg-white/70 rounded-md text-center font-semibold">
-                    Image is temporary (local-only).
-                </p>
-            )}
-
-        </div>
-
-        {/* Action Section - 2/3 width on desktop */}
-        <div className="lg:col-span-2">
-          <button
-            onClick={() => setIsActionsOpen(!isActionsOpen)}
-            className="w-full bg-gray-100 text-gray-700 p-3 rounded-xl font-semibold hover:bg-gray-200 transition duration-150 flex justify-between items-center mb-4 shadow-md border"
-          >
-            {drawing.actions.length} Action Items {status === 'green' ? '(All Complete)' : `(Progress: ${Math.round(drawing.actions.reduce((acc, a) => acc + calculatePercentFromSteps(a.steps), 0) / drawing.actions.length)}%)`}
-            {isActionsOpen ? <ChevronUp className="w-5 h-5" /> : <ChevronDown className="w-5 h-5" />}
-          </button>
-          {isActionsOpen && (
-            <ActionList 
-              drawing={drawing} 
-              scope={scope} 
-              updateScopeData={updateScopeData} 
-              openModal={setSelectedAction} 
-              isAbatement={isLeadAbatement} // Pass flag down
-            />
-          )}
-        </div>
-      </div>
-    </div>
-  );
 };
 
-const ScopePage = ({ scope, updateScopeData, allScopes }) => {
-  if (!scope) return <div className="p-4 text-center text-gray-500">Scope data not found.</div>;
-  
-  // Determine if this is the Lead Abatement page
-  const isLeadAbatement = scope.id === LEAD_ABATEMENT_ID;
-  const partsTitle = isLeadAbatement ? 'Things needing Abating' : 'Parts Tracking';
-  const relatedScopes = OTHER_SCOPES; // List of scopes excluding Lead Abatement
 
-  const addNewDrawing = () => {
-    const defaultDrawingName = `${scope.title.substring(0, 4)}-PART-NEW-${Math.floor(Math.random() * 100)}`;
-    const newDrawing = {
-      id: crypto.randomUUID(),
-      name: defaultDrawingName,
-      description: 'Newly added part or document for scope tracking',
-      imageUrl: '',
-      relatedScopeId: null, // Ensure new items have this field
-      actions: [
-        { 
-            id: crypto.randomUUID(), 
-            description: 'Define Scope of Work', 
-            percentComplete: 0, 
-            notes: '', 
-            // New items in abatement scopes start with one step
-            steps: [{ id: crypto.randomUUID(), description: isLeadAbatement ? 'Abatement Action Complete?' : 'Review required permits', isComplete: false }],
-            imageAttachment: null,
-            lastUpdated: new Date() 
-        },
-      ]
+// --- Sidebar Navigation Component ---
+const Sidebar = ({ isOpen, toggleSidebar, currentPage, setCurrentPage, scopes, userId }) => {
+    const handleNavigation = (pageId) => {
+        setCurrentPage(pageId);
+        if (isOpen) {
+            toggleSidebar();
+        }
     };
-    const updatedScope = { ...scope, drawings: [...scope.drawings, newDrawing] };
-    updateScopeData(scope.id, updatedScope);
-  };
-  
-  // --- EXPORT FUNCTIONALITY (Print to PDF) ---
-  const handleExport = useCallback(() => {
-    const reportTitle = `${scope.title} - Progress Report (${new Date().toLocaleDateString()})`;
-    
-    // Generate HTML for all drawings
-    const drawingsHtml = scope.drawings.map(drawing => {
-        const status = getDrawingStatus(drawing.actions);
-        const statusText = status === 'green' ? 'Complete' : (status === 'yellow' ? 'In Progress' : 'Not Started');
-        const statusColor = status === 'green' ? 'green' : (status === 'yellow' ? 'orange' : 'red');
-        
-        // Calculate part completion percentage
-        const actions = drawing.actions || [];
-        const totalActionPercent = actions.reduce((acc, a) => acc + calculatePercentFromSteps(a.steps), 0);
-        const partCompletion = actions.length > 0 ? Math.round(totalActionPercent / actions.length) : 0;
 
-        const actionItems = actions.map(action => {
-            const percent = calculatePercentFromSteps(action.steps);
-            return `
-                <li style="display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px dotted #ccc;">
-                    <span style="flex-grow: 1;">${action.description}</span>
-                    <span style="font-weight: bold; color: ${percent === 100 ? 'green' : (percent > 0 ? 'orange' : 'red')};">${percent}%</span>
-                </li>
-            `;
-        }).join('');
+    return (
+        <>
+            {/* Overlay */}
+            {isOpen && (
+                <div 
+                    className="fixed inset-0 z-40 bg-black bg-opacity-50 transition-opacity md:hidden"
+                    onClick={toggleSidebar}
+                />
+            )}
 
-        // Use a placeholder image if imageSource is not available
-        // NOTE: We rely on the current browser session's memory (localImageUrl) or the placeholder.
-        const imageHtml = drawing.imageUrl ? `<img src="${drawing.imageUrl}" style="max-width: 100%; height: auto; border-radius: 8px;">` : 
-            `<div style="width: 100%; height: 150px; background: #eee; border: 1px dashed #aaa; display: flex; align-items: center; justify-content: center; color: #555; border-radius: 8px; font-size: 0.9em; text-align: center;">No Image Uploaded</div>`;
-
-        return `
-            <div style="border: 2px solid ${statusColor}; padding: 20px; margin-bottom: 30px; border-radius: 12px; background: #f9f9f9; page-break-inside: avoid;">
-                <h4 style="font-size: 1.4em; font-weight: bold; margin-top: 0; margin-bottom: 15px; display: flex; justify-content: space-between; align-items: center; color: #1f2937;">
-                    ${drawing.name}
-                    <span style="font-size: 0.9em; font-weight: bold; padding: 5px 10px; border-radius: 15px; color: white; background-color: ${statusColor};">${statusText}</span>
-                </h4>
+            {/* Sidebar Content */}
+            <div className={`fixed top-0 left-0 h-full w-64 bg-white shadow-2xl z-50 transform transition-transform duration-300 ease-in-out 
+                ${isOpen ? 'translate-x-0' : '-translate-x-full'} md:relative md:translate-x-0 md:shadow-lg md:h-screen md:flex md:flex-col`}>
                 
-                <div style="display: grid; grid-template-columns: 1fr 2fr; gap: 25px;">
-                    <div style="min-width: 150px; display: flex; flex-direction: column; align-items: center;">
-                        <p style="font-size: 1.1em; font-weight: bold; color: ${partCompletion === 100 ? 'green' : (partCompletion > 0 ? 'orange' : 'red')}; margin-bottom: 5px;">${partCompletion}% Complete</p>
-                        ${imageHtml}
-                    </div>
-                    <div>
-                        <p style="font-weight: bold; margin-top: 0; margin-bottom: 10px; font-size: 1.1em; border-bottom: 1px solid #ddd;">Action Items (${actions.length}):</p>
-                        <ul style="list-style: none; padding: 0;">
-                            ${actionItems}
-                        </ul>
-                    </div>
+                <div className="p-4 border-b flex justify-between items-center">
+                    <h2 className="text-xl font-bold text-indigo-700">MCR4 TMODs</h2>
+                    <button onClick={toggleSidebar} className="text-gray-500 hover:text-gray-800 md:hidden p-1">
+                        <X size={24} />
+                    </button>
                 </div>
+
+                <nav className="flex flex-col p-2 space-y-1 overflow-y-auto flex-grow">
+                    {scopes.map(scope => (
+                        <button
+                            key={scope.id}
+                            onClick={() => handleNavigation(scope.id)}
+                            className={`flex items-center px-3 py-2 rounded-lg text-sm font-medium transition duration-150 
+                                ${currentPage === scope.id 
+                                    ? 'bg-indigo-100 text-indigo-700 shadow-sm font-semibold' 
+                                    : 'text-gray-600 hover:bg-gray-50 hover:text-gray-800'}`}
+                        >
+                            {scope.id === 'summary' ? (
+                                <svg className="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
+                            ) : (
+                                <svg className="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"></path></svg>
+                            )}
+                            {scope.title}
+                        </button>
+                    ))}
+                </nav>
             </div>
-        `;
-    }).join('');
-
-    // 2. Construct HTML for Print Window
-    const printWindow = window.open('', '_blank');
-    printWindow.document.write(`
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>${reportTitle}</title>
-            <style>
-                @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
-                body { font-family: 'Inter', sans-serif; padding: 30px; margin: 0; color: #333; line-height: 1.4; }
-                h1 { color: #1f2937; border-bottom: 4px solid #10B981; padding-bottom: 15px; margin-bottom: 30px; font-size: 2.2em; font-weight: 800; }
-                /* Layout for grid in print */
-                div[style*="grid-template-columns"] {
-                    display: grid;
-                    grid-template-columns: 1fr 2fr;
-                }
-                @media print {
-                    .no-print { display: none; }
-                }
-                /* Ensures images load and are styled correctly */
-                img { max-width: 100%; height: auto; display: block; }
-            </style>
-        </head>
-        <body>
-            <h1>${scope.title} Parts Tracking Report</h1>
-            ${drawingsHtml}
-            <div style="margin-top: 40px; font-size: 0.8em; color: #666; border-top: 1px solid #ccc; padding-top: 10px;">
-                Report generated by MCR4 TMODs Progress Tracker on ${new Date().toLocaleString()}.
-            </div>
-            <script>
-                // This timeout gives the browser time to render any large Base64 image data 
-                // that might be present in the dynamic HTML before printing is initiated.
-                window.onload = function() {
-                    setTimeout(() => {
-                        window.print();
-                        setTimeout(() => window.close(), 100); 
-                    }, 500); // 500ms delay
-                }
-            </script>
-        </body>
-        </html>
-    `);
-    printWindow.document.close();
-  }, [scope]);
-
-  return (
-    <div className="p-4 sm:p-6 bg-gray-50 min-h-screen pt-24"> {/* Main content padding for header clearance */}
-      
-      {/* Prerequisite Section */}
-      {!isLeadAbatement && <PrereqSection scope={scope} updateScopeData={updateScopeData} allScopes={allScopes} />}
-
-      <section className="mt-8">
-        <div className="flex justify-between items-center mb-6">
-          <h2 className="text-2xl font-bold text-gray-800">
-            {partsTitle}
-          </h2>
-          {/* Grouped Action Buttons */}
-          <div className="flex space-x-3">
-            <button
-              onClick={handleExport}
-              className="bg-purple-600 text-white p-3 rounded-xl font-bold hover:bg-purple-700 transition shadow-lg flex items-center text-sm"
-              title="Export Scope Data as PDF"
-            >
-              <Download className="w-5 h-5 mr-2" /> Export Report (PDF)
-            </button>
-            <button
-              onClick={addNewDrawing}
-              className="bg-green-600 text-white p-2 rounded-xl shadow-lg hover:bg-green-700 transition"
-              title={`Add New ${isLeadAbatement ? 'Abatement Item' : 'Part'}`}
-            >
-              <Plus className="w-5 h-5" />
-            </button>
-          </div>
-        </div>
-        
-        <div className="space-y-8">
-          {scope.drawings.map((drawing) => (
-            <DrawingCard
-              key={drawing.id}
-              drawing={drawing}
-              scope={scope}
-              updateScopeData={updateScopeData}
-              isLeadAbatement={isLeadAbatement} 
-              relatedScopes={relatedScopes}
-            />
-          ))}
-          {scope.drawings.length === 0 && (
-            <p className="text-center text-gray-500 p-10 border border-dashed border-gray-300 rounded-xl bg-white shadow-md">
-              {`No ${partsTitle.toLowerCase()} added yet. Click the '+' button to start tracking.`}
-            </p>
-          )}
-        </div>
-      </section>
-    </div>
-  );
+        </>
+    );
 };
 
-const SummaryPage = ({ scopes, setCurrentPage }) => {
-  const summaryData = useMemo(() => {
-    const allDrawings = Object.values(scopes).flatMap(scope => scope.drawings || []);
-    const totalDrawings = allDrawings.length;
-    let totalActionsSteps = 0;
-    let completedActionsSteps = 0;
 
-    // Calculate total steps across all scopes
-    allDrawings.forEach(drawing => {
-      drawing.actions.forEach(action => {
-          totalActionsSteps += action.steps?.length || 0;
-          completedActionsSteps += (action.steps || []).filter(s => s.isComplete).length;
-      });
-    });
-    
-    // Calculate Project Completion based on number of parts fully complete (using Part Status Logic)
-    let completePartCount = 0;
-    allDrawings.forEach(drawing => {
-        if (getDrawingStatus(drawing.actions) === 'green') {
-            completePartCount++;
+// --- Main Application Component ---
+export default function App() {
+    const { scopes, userId, updateScopeData, isLoading, error } = useFirebase();
+    const [currentPage, setCurrentPage] = useState('summary');
+    const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+
+    // Default to summary page if scope data loads and current page is missing
+    useEffect(() => {
+        if (!isLoading && scopes.length > 0 && !scopes.some(s => s.id === currentPage)) {
+            setCurrentPage('summary');
         }
-    });
+    }, [isLoading, scopes, currentPage]);
 
-    const completionRate = totalDrawings > 0 ? (completePartCount / totalDrawings) * 100 : 0;
-    const actionCompletionRate = totalActionsSteps > 0 ? (completedActionsSteps / totalActionsSteps) * 100 : 0;
+    const currentScope = scopes.find(s => s.id === currentPage);
+    const scopeTitle = currentScope?.title || 'Loading...';
 
-    return {
-      completionRate,
-      actionCompletionRate,
-    };
-  }, [scopes]);
-
-  const sortedScopes = useMemo(() => {
-    return Object.values(scopes).sort((a, b) => {
-      const aDrawings = a.drawings || [];
-      const bDrawings = b.drawings || [];
-      // Calculate overall status for sorting by severity (Red > Yellow > Green)
-      const aStatus = getDrawingStatus(aDrawings.flatMap(d => d.actions));
-      const bStatus = getDrawingStatus(bDrawings.flatMap(d => d.actions));
-
-      const statusOrder = { red: 3, yellow: 2, green: 1 };
-      return statusOrder[bStatus] - statusOrder[aStatus];
-    });
-  }, [scopes]);
-  
-  // New smaller ring component for the breakdown section
-  const MiniProgressRing = ({ percentage }) => {
-    const radius = 15;
-    const circumference = 2 * Math.PI * radius;
-    const offset = circumference - (percentage / 100) * circumference;
-    const color = percentage === 100 ? 'text-green-600' : (percentage > 0 ? 'text-yellow-500' : 'text-red-500');
-
-    return (
-        <div className="relative w-12 h-12 flex items-center justify-center flex-shrink-0">
-            <svg className="w-full h-full transform -rotate-90">
-                <circle
-                    className="text-gray-300"
-                    strokeWidth="3"
-                    stroke="currentColor"
-                    fill="transparent"
-                    r={radius}
-                    cx="50%"
-                    cy="50%"
-                />
-                <circle
-                    className={color}
-                    strokeWidth="3"
-                    strokeDasharray={circumference}
-                    strokeDashoffset={offset}
-                    strokeLinecap="round"
-                    stroke="currentColor"
-                    fill="transparent"
-                    r={radius}
-                    cx="50%"
-                    cy="50%"
-                />
-            </svg>
-            <span className="absolute text-[10px] font-bold text-gray-800">{percentage}%</span>
-        </div>
-    );
-  };
-
-
-  const ProgressRing = ({ percentage, color, label }) => {
-    const radius = 50;
-    const circumference = 2 * Math.PI * radius;
-    const offset = circumference - (percentage / 100) * circumference;
-
-    return (
-      <div className="relative w-32 h-32 flex items-center justify-center">
-        <svg className="w-full h-full transform -rotate-90">
-          <circle
-            className="text-gray-300"
-            strokeWidth="8"
-            stroke="currentColor"
-            fill="transparent"
-            r={radius}
-            cx="50%"
-            cy="50%"
-          />
-          <circle
-            className={color}
-            strokeWidth="8"
-            strokeDasharray={circumference}
-            strokeDashoffset={offset}
-            strokeLinecap="round"
-            stroke="currentColor"
-            fill="transparent"
-            r={radius}
-            cx="50%"
-            cy="50%"
-          />
-        </svg>
-        <div className="absolute flex flex-col items-center">
-          <span className="text-2xl font-extrabold text-gray-800">{Math.round(percentage)}%</span>
-          <span className="text-xs text-gray-500">{label}</span>
-        </div>
-      </div>
-    );
-  };
-
-  return (
-    <div className="p-4 sm:p-8 bg-gray-50 min-h-screen pt-24"> {/* Increased padding-top for header clearance */}
-      <h2 className="text-3xl font-extrabold text-gray-900 mb-8 border-b border-gray-300 pb-3">Overall Project Status</h2>
-
-      <div className="flex flex-col sm:flex-row justify-center items-center space-y-6 sm:space-y-0 sm:space-x-12 mb-12 p-8 bg-white rounded-2xl shadow-xl">
-        <ProgressRing percentage={summaryData.completionRate} color="text-green-500" label="TMODs completion" />
-        <ProgressRing percentage={summaryData.actionCompletionRate} color="text-blue-600" label="Action Item Progress" />
-      </div>
-
-      <h2 className="text-2xl font-extrabold text-gray-800 mb-6 border-b pb-2">Scope Breakdown</h2>
-      <div className="space-y-4">
-        {sortedScopes.map(scope => {
-          const drawingCount = scope.drawings?.length || 0;
-          
-          // Calculate average completion rate for the scope
-          let scopeCompletionRate = 0;
-          if (drawingCount > 0) {
-              const totalPartCompletion = scope.drawings.reduce((sum, d) => {
-                  // Calculate average action completion for the part
-                  const actions = d.actions || [];
-                  if (actions.length === 0) return sum + 0;
-                  
-                  const totalActionPercent = actions.reduce((acc, a) => acc + calculatePercentFromSteps(a.steps), 0);
-                  return sum + (totalActionPercent / actions.length);
-              }, 0);
-              scopeCompletionRate = Math.round(totalPartCompletion / drawingCount);
-          }
-          
-          const status = getDrawingStatus(scope.drawings?.flatMap(d => d.actions));
-          let statusColor = 'bg-gray-100';
-
-          if (drawingCount > 0) {
-            if (status === 'green') statusColor = 'bg-green-50 border-green-400';
-            else if (status === 'yellow') statusColor = 'bg-yellow-50 border-yellow-400';
-            else statusColor = 'bg-red-50 border-red-400';
-          }
-
-          return (
-            <div 
-              key={scope.id} 
-              onClick={() => setCurrentPage(scope.title)} // Make clickable for navigation
-              className={`p-5 rounded-2xl shadow-md border-l-8 ${statusColor} flex justify-between items-center transition hover:shadow-lg hover:border-l-[12px] cursor-pointer`}
-            >
-              <h3 className="text-xl font-bold text-gray-800">{scope.title}</h3>
-              
-              <div className="flex items-center space-x-6">
-                <div className="text-right hidden sm:block">
-                  <p className="text-sm font-semibold text-gray-600">{drawingCount} Parts</p>
-                  <p className={`text-xs font-bold ${scopeCompletionRate === 100 ? 'text-green-600' : (scopeCompletionRate > 0 ? 'text-yellow-600' : 'text-red-600')}`}>
-                    {scopeCompletionRate === 100 ? 'Complete' : (scopeCompletionRate > 0 ? 'In Progress' : 'Not Started')}
-                  </p>
-                </div>
-                <MiniProgressRing percentage={scopeCompletionRate} />
-              </div>
+    if (error) {
+        return (
+            <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-red-50 text-red-800">
+                <h1 className="text-2xl font-bold mb-3">Deployment Error</h1>
+                <p className="text-lg mb-6 text-center">
+                    Configuration Error: {error}. This is often caused by missing Firebase configuration keys.
+                </p>
+                <p className="text-sm text-center bg-red-100 p-3 rounded-lg border border-red-300">
+                    Your environment must provide the global variables: 
+                    <code className="block mt-2 font-mono">__app_id, __firebase_config, __initial_auth_token</code>
+                </p>
+                <p className="text-sm font-semibold mt-4">User ID: {userId}</p>
             </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-};
-
-
-const App = () => {
-  const NAV_ITEMS = ['MCR4 TMODs Summary', ...SCOPE_NAMES];
-  const [currentPage, setCurrentPage] = useState(NAV_ITEMS[0]);
-  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-
-  const { scopes, userId, isLoading, error, updateScopeData } = useFirebase();
-
-  const toggleSidebar = () => setIsSidebarOpen(!isSidebarOpen);
-
-  const currentTitle = currentPage === 'MCR4 TMODs Summary' ? currentPage : `TMOD: ${currentPage}`;
-  const currentScopeId = currentPage === 'MCR4 TMODs Summary' ? null : currentPage.toLowerCase().replace(/[^a-z0-9]+/g, '_');
-  const currentScope = currentScopeId ? scopes[currentScopeId] : null;
-
-  // Logging for debugging the user's issue
-  useEffect(() => {
-    if (isLoading) {
-      console.log("APP STATUS: Global Loading...");
-    } else if (NAV_ITEMS.includes(currentPage) && !currentScope) {
-      console.log(`APP STATUS: Waiting for specific scope data: ${currentPage} (Scopes count: ${Object.keys(scopes).length})`);
-    } else if (!isLoading && userId) {
-      console.log("APP STATUS: Loaded successfully.");
+        );
     }
-  }, [isLoading, userId, currentPage, currentScope, scopes]);
 
-  // Handle Loading/Error States
-  let content;
-  if (error) {
-    content = <div className="p-4 pt-20 text-center text-red-600 bg-red-50 min-h-screen"><p className="font-bold">Error:</p><p className="break-words">{error}</p></div>;
-  } else if (isLoading || !userId) {
-    content = (
-      <div className="flex flex-col items-center justify-center min-h-screen text-gray-600">
-        <Loader className="w-10 h-10 animate-spin text-blue-600" />
-        <p className="mt-4 text-lg font-medium">Loading Project Data...</p>
-        <p className="text-sm">Connecting to real-time database.</p>
-      </div>
-    );
-  } else if (currentPage === 'MCR4 TMODs Summary') {
-    content = <SummaryPage scopes={scopes} setCurrentPage={setCurrentPage} />;
-  } else if (currentScope) {
-    // Pass the entire scopes object to ScopePage for cross-reference lookups
-    content = <ScopePage scope={currentScope} updateScopeData={updateScopeData} allScopes={scopes} />;
-  } else if (NAV_ITEMS.includes(currentPage)) {
-      // If a valid navigation item is selected, but the data hasn't fully loaded yet (i.e. currentScope is missing).
-      content = (
-          <div className="p-4 pt-20 text-center text-gray-500 min-h-screen">
-              <Loader className="w-8 h-8 mx-auto mb-3 animate-spin text-blue-500" />
-              <p className="font-semibold">Loading scope data or initializing...</p>
-              <p className="text-sm">If this persists, check the console for Firebase errors.</p>
-          </div>
-      );
-  } else {
-    // Fallback for an unselected or non-existent page
-    content = <div className="p-4 pt-20 text-center text-gray-500">Select a scope from the menu to view progress.</div>;
-  }
+    if (isLoading || scopes.length === 0) {
+        return (
+            <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-gray-50">
+                <div className="animate-spin rounded-full h-16 w-16 border-b-4 border-indigo-500 mb-4" />
+                <h1 className="text-xl font-bold text-gray-700">Loading scope data or initializing...</h1>
+                <p className="text-sm text-gray-500 mt-2">Connecting to Firestore and checking for default data.</p>
+                <p className="text-sm font-semibold mt-4">User ID: {userId || 'Loading...'}</p>
+            </div>
+        );
+    }
 
-  return (
-    <div className="font-sans antialiased bg-gray-50 min-h-screen">
-      <style>{`
-        /* Custom Styles for Checkbox - ensuring good visibility */
-        input[type="checkbox"]:checked {
-            background-color: #10B981; /* Green checkmark */
-            border-color: #10B981;
+    const renderPage = () => {
+        if (!currentScope) {
+            return (
+                <div className="p-8 text-center text-gray-500">
+                    Scope not found. Please select a page from the menu.
+                </div>
+            );
         }
+        
+        if (currentPage === 'summary') {
+            return <SummaryPage scopes={scopes} setCurrentPage={setCurrentPage} />;
+        }
+        
+        return (
+            <ScopePage 
+                scope={currentScope} 
+                updateScopeData={updateScopeData} 
+                allScopes={scopes} 
+                setCurrentPage={setCurrentPage} 
+            />
+        );
+    };
 
-      `}</style>
-      <Header currentTitle={currentTitle} toggleSidebar={toggleSidebar} />
-      <Sidebar
-        isOpen={isSidebarOpen}
-        toggleSidebar={toggleSidebar}
-        navItems={NAV_ITEMS}
-        currentPage={currentPage}
-        setCurrentPage={setCurrentPage}
-        userId={userId}
-      />
-      <main className="transition-all duration-300">
-        {content}
-      </main>
-    </div>
-  );
-};
+    return (
+        <div className="flex min-h-screen bg-gray-50">
+            {/* Sidebar (Desktop) */}
+            <div className="hidden md:block">
+                <Sidebar 
+                    isOpen={isSidebarOpen} 
+                    toggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)} 
+                    currentPage={currentPage} 
+                    setCurrentPage={setCurrentPage} 
+                    scopes={scopes}
+                    userId={userId}
+                />
+            </div>
 
-export default App;
+            {/* Sidebar (Mobile/Overlay) */}
+            <Sidebar 
+                isOpen={isSidebarOpen} 
+                toggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)} 
+                currentPage={currentPage} 
+                setCurrentPage={setCurrentPage} 
+                scopes={scopes}
+                userId={userId}
+            />
+
+
+            {/* Main Content Area */}
+            <div className="flex-grow flex flex-col transition-all duration-300">
+                {/* Top Bar for Mobile Navigation */}
+                <header className="flex items-center p-4 bg-white shadow-md md:hidden sticky top-0 z-30">
+                    <button onClick={() => setIsSidebarOpen(true)} className="text-gray-700 hover:text-indigo-600 p-2 rounded-lg">
+                        <Menu size={24} />
+                    </button>
+                    <h1 className="text-lg font-bold text-gray-800 ml-4 truncate">
+                        {scopeTitle}
+                    </h1>
+                </header>
+
+                {/* Main Content */}
+                <main className="flex-grow p-4 md:p-0 overflow-x-hidden">
+                    {renderPage()}
+                </main>
+                
+                {/* Footer showing User ID */}
+                <footer className="p-4 border-t bg-white text-xs text-gray-500 flex justify-between items-center">
+                    <span>
+                        MCR4 TMODs Tracker v1.0 | Collaborative Progress
+                    </span>
+                    <span>
+                        User ID: {userId}
+                    </span>
+                </footer>
+            </div>
+        </div>
+    );
+}
