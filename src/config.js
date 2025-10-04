@@ -1,31 +1,22 @@
-/**
- * WARNING: For a real production app, these values should typically be loaded 
- * from secure environment variables (e.g., in a .env file ignored by git)
- * and injected during the build process.
- * * For this single-file React environment, we define them here.
- * * !!! REPLACE ALL PLACEHOLDER VALUES BELOW WITH YOUR ACTUAL FIREBASE CONFIG !!!
- */
+// This file exports the necessary configuration for Firebase and the application
+// environment, allowing it to work correctly on Netlify.
 
-// This ID is used by the app to create a unique path in Firestore 
-// (e.g., /artifacts/mcr4-tmods-app-id/...)
-// You can make this any unique string you want.
-export const __app_id = "mcr4-tmods-app-id-unique"; 
+// *** IMPORTANT: REPLACE ALL PLACEHOLDER VALUES WITH YOUR ACTUAL FIREBASE KEYS ***
 
-// This is your standard Firebase project config object (from the Firebase Console -> Project Settings)
-// This is converted to a JSON string for compatibility with the original environment.
-const firebaseConfigObject = {
+// 1. Application Identifier: Used for unique data storage paths in Firestore.
+export const APP_ID = "mcr4-tmods-project"; // You can use this default value.
+
+// 2. Initial Authentication Token: This is a placeholder for the custom token
+// the app expects to receive to sign in. We use a dummy value for deployment.
+export const INITIAL_AUTH_TOKEN = "dummy-auth-token-for-prod";
+
+// 3. Firebase Configuration: Your specific project keys from the Firebase Console.
+// Replace everything inside the braces { ... } with your actual settings.
+export const FIREBASE_CONFIG = {
     apiKey: "AIzaSyCjLWKCJMmW3PiJ8SyZXDpA7QCTfbJyME8", 
     authDomain: "tmods-overall.firebaseapp.com",
     projectId: "tmods-overall",
     storageBucket: "tmods-overall.firebasestorage.app",
     messagingSenderId: "672257211065",
     appId: "1:672257211065:web:9e2eba91a621e984ca7968"
-    // databaseURL is usually not required for Firestore-only projects
 };
-
-export const __firebase_config = JSON.stringify(firebaseConfigObject);
-
-// This is normally a token provided by the environment for authenticated sign-in.
-// For local/Netlify deployment, we leave it undefined so the app falls back 
-// to signInAnonymously() to establish a user session.
-export const __initial_auth_token = undefined;
