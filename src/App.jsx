@@ -2,7 +2,8 @@ import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import { initializeApp } from 'firebase/app';
 import { getFirestore, doc, setDoc, collection, query, onSnapshot, writeBatch } from 'firebase/firestore';
-import { Menu, X, Plus, Trash2, Edit, Check, ChevronDown, CheckCircle, Clock, XOctagon } from 'lucide-react';
+import { getStorage, ref, uploadString, getDownloadURL, deleteObject } from 'firebase/storage'; // NEW: Storage Imports
+import { Menu, X, Plus, Trash2, Edit, Check, ChevronDown, CheckCircle, Clock, XOctagon, Upload, Loader2 } from 'lucide-react';
 // setLogLevel is imported here to debug firestore connection issues
 import { setLogLevel } from 'firebase/firestore'; 
 
@@ -96,7 +97,8 @@ const calculateStepCompletion = (steps) => {
 const createDefaultPart = (title) => ({
     id: crypto.randomUUID(),
     title: title || `New Part ${crypto.randomUUID().slice(0, 4)}`,
-    imageUrl: '',
+    imageUrl: '', // Stores permanent Firebase Storage URL
+    imageStoragePath: '', // Stores the path to delete it later
     actions: [],
     // For Lead Abatement, this is used to link to other scopes
     relatedScopeId: 'none', 
@@ -149,6 +151,7 @@ const createDefaultScopeData = (scopeId) => ({
 const useFirebase = () => {
     const [db, setDb] = useState(null);
     const [auth, setAuth] = useState(null);
+    const [storage, setStorage] = useState(null); // NEW: Storage state
     const [userId, setUserId] = useState(null);
     const [scopes, setScopes] = useState([]);
     const [isLoading, setIsLoading] = useState(true);
@@ -185,9 +188,11 @@ const useFirebase = () => {
 
         const firestore = getFirestore(firebaseApp);
         const firebaseAuth = getAuth(firebaseApp);
+        const firebaseStorage = getStorage(firebaseApp); // NEW: Get Storage instance
 
         setDb(firestore);
         setAuth(firebaseAuth);
+        setStorage(firebaseStorage); // NEW: Set Storage state
 
         const authenticate = async () => {
             try {
@@ -219,6 +224,39 @@ const useFirebase = () => {
         authenticate();
         return () => unsubscribe();
     }, [firebaseApp]);
+    
+    // NEW: Function to upload image to Firebase Storage
+    const uploadImage = useCallback(async (base64Data, path) => {
+        if (!storage) {
+            console.error("Firebase Storage not initialized.");
+            return null;
+        }
+
+        const storageRef = ref(storage, path);
+        const MAX_RETRIES = 3;
+        let lastError = null;
+
+        for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            try {
+                // Upload the base64 string
+                await uploadString(storageRef, base64Data, 'data_url');
+                // Get the public download URL
+                const url = await getDownloadURL(storageRef);
+                return url;
+            } catch (e) {
+                lastError = e;
+                console.warn(`Upload attempt ${attempt + 1} failed for path ${path}. Retrying in ${Math.pow(2, attempt)}s... Error:`, e.message);
+                if (attempt < MAX_RETRIES - 1) {
+                    await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
+                }
+            }
+        }
+        console.error(`Failed to upload image after ${MAX_RETRIES} attempts. Last error:`, lastError);
+        // Do not use setError here, just return null so the component can handle it locally
+        return null;
+
+    }, [storage]);
+
 
     // 2. Data Synchronization (Scopes and Parts)
     useEffect(() => {
@@ -352,7 +390,7 @@ const useFirebase = () => {
     }, [db]);
 
 
-    return { scopes, userId, updateScopeData, isLoading, error, db };
+    return { scopes, userId, updateScopeData, isLoading, error, db, uploadImage }; // NEW: Return uploadImage
 };
 
 
@@ -362,7 +400,7 @@ const useFirebase = () => {
 const StatusBadge = ({ percent, readOnly }) => {
     const color = getStatusColor(percent);
     const label = getStatusLabel(percent);
-    const icon = percent === 100 ? CheckCircle : percent > 0 ? Clock : XOctagon;
+    // const icon = percent === 100 ? CheckCircle : percent > 0 ? Clock : XOctagon;
 
     return (
         <div className={`flex items-center space-x-2 text-sm font-semibold ${readOnly ? 'text-gray-500' : 'text-gray-800'}`}>
@@ -436,7 +474,7 @@ const getLeadAbatementProgressForScope = (scopeId, allScopes) => {
 
 // --- Modals ---
 
-// Modal for tracking steps and notes for Materials and General Prerequisites
+// Modal for tracking steps and notes for Materials and General Prerequisites (No change needed here)
 const PrereqModal = ({ isOpen, onClose, prereqKey, scope, updateScopeData }) => {
     if (!isOpen) return null;
 
@@ -574,14 +612,23 @@ const PrereqModal = ({ isOpen, onClose, prereqKey, scope, updateScopeData }) => 
 };
 
 
-// Modal for tracking steps, notes, and temporary image for Part Actions
-const ActionModal = ({ isOpen, onClose, action, scope, part, updateScopeData }) => {
+// NEW: Modal for tracking steps, notes, and PERMANENT image for Part Actions
+const ActionModal = ({ isOpen, onClose, action, scope, part, updateScopeData, uploadImage, userId }) => {
     if (!isOpen) return null;
 
     const [steps, setSteps] = useState(action.steps || []);
     const [notes, setNotes] = useState(action.notes || '');
     const [newStepText, setNewStepText] = useState('');
-    const [dataURL, setDataURL] = useState(null); // Temporary image data URL
+    
+    // State to manage the image during the modal session
+    const [imageState, setImageState] = useState({
+        url: action.imageUrl || null, // Permanent URL from Firestore
+        storagePath: action.imageStoragePath || null,
+        tempDataURL: null, // Temporary Base64 for instant preview of new upload
+    });
+    
+    const [isUploading, setIsUploading] = useState(false);
+    const [uploadError, setUploadError] = useState('');
 
     const calculatedPercent = calculateStepCompletion(steps);
 
@@ -602,27 +649,58 @@ const ActionModal = ({ isOpen, onClose, action, scope, part, updateScopeData }) 
         setSteps(steps.filter(step => step.id !== id));
     };
 
-    const handleImageUpload = (e) => {
+    const handleImageUpload = async (e) => {
         const file = e.target.files[0];
-        if (file) {
-            const reader = new FileReader();
-            reader.onloadend = () => {
-                setDataURL(reader.result);
-                // NOTE: We DO NOT call updateScopeData here to avoid saving the massive Base64 string to Firestore.
-                // The image remains temporary (session-only).
-            };
-            reader.readAsDataURL(file);
+        setUploadError('');
+        if (!file) return;
+
+        // Note: Real file size limit is set by Firebase Storage rules, but 1MB is a good practice limit.
+        if (file.size > 1024 * 1024) { 
+            setUploadError('File size exceeds 1MB limit.');
+            return;
         }
+
+        const reader = new FileReader();
+        reader.onloadend = async () => {
+            const base64Data = reader.result;
+            setImageState(prev => ({ ...prev, tempDataURL: base64Data })); // Local Preview
+            setIsUploading(true);
+            setUploadError('');
+            
+            const now = new Date().getTime();
+            // Store images publicly under /artifacts/{appId}/public/images/actions/{scopeId}/{partId}/{actionId}/{userId}_{timestamp}_{filename}
+            const storagePath = `artifacts/${APP_ID}/public/images/actions/${scope.id}/${part.id}/${action.id}/${userId}_${now}_${file.name}`;
+            
+            // Upload to Firebase Storage
+            const permanentUrl = await uploadImage(base64Data, storagePath);
+
+            setIsUploading(false);
+
+            if (permanentUrl) {
+                setImageState({
+                    url: permanentUrl,
+                    storagePath: storagePath,
+                    tempDataURL: null, 
+                });
+            } else {
+                setUploadError('Image upload failed. Check the console for details.');
+                setImageState(prev => ({ ...prev, tempDataURL: null })); 
+            }
+        };
+        reader.readAsDataURL(file);
     };
 
+
     const handleSave = () => {
+        const newPercent = calculateStepCompletion(steps);
+
         const updatedAction = {
             ...action,
             notes: notes,
             steps: steps,
-            percentComplete: calculatedPercent,
-            // We only save basic metadata about the image, NOT the large dataURL itself.
-            imageAttachment: dataURL ? { name: `Attachment-${new Date().toISOString()}`, saved: false } : null,
+            percentComplete: newPercent,
+            imageUrl: imageState.url, // Save the permanent URL
+            imageStoragePath: imageState.storagePath, // Save the path
         };
 
         const updatedParts = scope.parts.map(p => {
@@ -641,6 +719,8 @@ const ActionModal = ({ isOpen, onClose, action, scope, part, updateScopeData }) 
         updateScopeData(scope.id, updatedScope);
         onClose();
     };
+    
+    const displayImageUrl = imageState.url || imageState.tempDataURL;
 
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50 p-4">
@@ -717,27 +797,42 @@ const ActionModal = ({ isOpen, onClose, action, scope, part, updateScopeData }) 
                         </div>
                     </div>
                     
-                    {/* Right Column: Image Attachment */}
+                    {/* Right Column: Image Attachment (Now Persistent) */}
                     <div className="space-y-4">
-                        <h3 className="text-lg font-bold text-gray-800 border-b pb-2">Image Attachment (Session Only)</h3>
+                        <h3 className="text-lg font-bold text-gray-800 border-b pb-2">Image Attachment (Persistent)</h3>
+                        
                         <div className="border-2 border-dashed border-gray-300 rounded-xl p-6 text-center shadow-inner bg-white">
                             <input 
-                                id="image-upload" 
+                                id={`image-upload-${action.id}`} 
                                 type="file" 
                                 accept="image/jpeg, image/png, image/jpg" 
                                 onChange={handleImageUpload} 
                                 className="hidden"
+                                disabled={isUploading}
                             />
-                            <label htmlFor="image-upload" className="cursor-pointer bg-blue-500 text-white px-4 py-2 rounded-lg font-semibold hover:bg-blue-600 transition inline-flex items-center shadow-md">
-                                <Plus size={18} className="mr-2" />
-                                Upload Image
+                            <label htmlFor={`image-upload-${action.id}`} className={`cursor-pointer text-white px-4 py-2 rounded-lg font-semibold transition inline-flex items-center shadow-md ${isUploading ? 'bg-gray-400' : 'bg-blue-500 hover:bg-blue-600'}`}>
+                                {isUploading ? (
+                                    <>
+                                        <Loader2 size={18} className="mr-2 animate-spin" /> Uploading...
+                                    </>
+                                ) : (
+                                    <>
+                                        <Upload size={18} className="mr-2" /> 
+                                        {displayImageUrl ? 'Change Image' : 'Upload Image'}
+                                    </>
+                                )}
                             </label>
-                            <p className="text-xs text-gray-500 mt-2">Max 1MB. Image is only visible in the current session.</p>
+                            <p className="text-xs text-gray-500 mt-2">Max 1MB. Image is saved to Firebase Storage.</p>
+                            {uploadError && <p className="text-sm text-red-500 mt-2 font-medium">{uploadError}</p>}
                         </div>
 
-                        {dataURL && (
+                        {displayImageUrl && (
                             <div className="relative border rounded-lg overflow-hidden shadow-lg">
-                                <img src={dataURL} alt="Attachment Preview" className="w-full h-auto object-cover"/>
+                                <img 
+                                    src={displayImageUrl} 
+                                    alt="Attachment Preview" 
+                                    className="w-full h-auto object-cover max-h-64"
+                                />
                             </div>
                         )}
                     </div>
@@ -747,7 +842,8 @@ const ActionModal = ({ isOpen, onClose, action, scope, part, updateScopeData }) 
                 <div className="p-4 border-t flex justify-end bg-gray-50 rounded-b-xl">
                     <button 
                         onClick={handleSave} 
-                        className="bg-green-600 text-white px-6 py-3 rounded-xl font-bold hover:bg-green-700 transition shadow-lg"
+                        disabled={isUploading}
+                        className={`text-white px-6 py-3 rounded-xl font-bold transition shadow-lg ${isUploading ? 'bg-gray-500 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700'}`}
                     >
                         Save Action Progress
                     </button>
@@ -761,12 +857,14 @@ const ActionModal = ({ isOpen, onClose, action, scope, part, updateScopeData }) 
 // --- Core Components ---
 
 // Renders the details for a single Part/Drawing/Thing needing Abating
-const DrawingCard = ({ part, scope, updateScopeData, allScopes, isLeadAbatementScope, otherScopeIds }) => {
+const DrawingCard = ({ part, scope, updateScopeData, allScopes, isLeadAbatementScope, otherScopeIds, uploadImage, userId }) => { // NEW: added uploadImage and userId
     const [isEditingTitle, setIsEditingTitle] = useState(false);
     const [newTitle, setNewTitle] = useState(part.title);
     const [actionModalOpen, setActionModalOpen] = useState(false);
     const [selectedAction, setSelectedAction] = useState(null);
-    const [localImageUrl, setLocalImageUrl] = useState(part.imageUrl); // For temporary display
+    const [localImageUrl, setLocalImageUrl] = useState(null); // Used for image upload preview/loading
+    const [isImageUploading, setIsImageUploading] = useState(false);
+    const [imageUploadError, setImageUploadError] = useState('');
 
     // Determine the color for the Part card border
     const borderColor = useMemo(() => {
@@ -826,16 +924,41 @@ const DrawingCard = ({ part, scope, updateScopeData, allScopes, isLeadAbatementS
     };
 
 
-    const handleImageUpload = (e) => {
+    // NEW: Handles permanent image upload for the Part card itself
+    const handleImageUpload = async (e) => {
         const file = e.target.files[0];
-        if (file) {
-            const reader = new FileReader();
-            reader.onloadend = () => {
-                setLocalImageUrl(reader.result);
-                // NOTE: We do not update Firestore here. The image is temporary (session-only).
-            };
-            reader.readAsDataURL(file);
-        }
+        if (!file) return;
+
+        setImageUploadError('');
+        setLocalImageUrl(null); // Clear previous preview
+        
+        const reader = new FileReader();
+        reader.onloadend = async () => {
+            const base64Data = reader.result;
+            setLocalImageUrl(base64Data); // Show instant preview
+            setIsImageUploading(true);
+            
+            const now = new Date().getTime();
+            // Store images publicly under /artifacts/{appId}/public/images/parts/{scopeId}/{partId}/{userId}_{timestamp}_{filename}
+            const storagePath = `artifacts/${APP_ID}/public/images/parts/${scope.id}/${part.id}/${userId}_${now}_${file.name}`;
+            
+            // Upload to Firebase Storage
+            const permanentUrl = await uploadImage(base64Data, storagePath);
+
+            setIsImageUploading(false);
+            setLocalImageUrl(null); // Clear temp URL after upload is complete
+
+            if (permanentUrl) {
+                // Update Firestore with the permanent URL
+                const updatedParts = scope.parts.map(p => 
+                    p.id === part.id ? { ...p, imageUrl: permanentUrl, imageStoragePath: storagePath } : p
+                );
+                updateScopeData(scope.id, { ...scope, parts: updatedParts });
+            } else {
+                setImageUploadError('Part image upload failed. Check the console.');
+            }
+        };
+        reader.readAsDataURL(file);
     };
     
     const handleRelatedScopeChange = (e) => {
@@ -855,6 +978,8 @@ const DrawingCard = ({ part, scope, updateScopeData, allScopes, isLeadAbatementS
                 title: newActionTitle,
                 percentComplete: 0,
                 notes: '',
+                imageUrl: '', // New: Persistent image URL for action
+                imageStoragePath: '', // New: Path for action image
                 steps: isLeadAbatementScope ? [{ id: crypto.randomUUID(), text: 'Complete Abatement Task', completed: false }] : [{ id: crypto.randomUUID(), text: 'Perform Task 1', completed: false }],
             };
             const updatedParts = scope.parts.map(p =>
@@ -882,6 +1007,9 @@ const DrawingCard = ({ part, scope, updateScopeData, allScopes, isLeadAbatementS
     };
 
     const partCompletionPercent = part.percentComplete || 0;
+    
+    // Display permanent image first, fallback to local preview if uploading
+    const displayImageUrl = part.imageUrl || localImageUrl; 
 
     return (
         <div className={`bg-white rounded-xl shadow-lg border-b-4 ${borderColor} transition-shadow duration-300 hover:shadow-xl`}>
@@ -894,6 +1022,8 @@ const DrawingCard = ({ part, scope, updateScopeData, allScopes, isLeadAbatementS
                     scope={scope} 
                     part={part}
                     updateScopeData={updateScopeData} 
+                    uploadImage={uploadImage} // NEW: Pass uploadImage
+                    userId={userId} // NEW: Pass userId
                 />
             )}
 
@@ -934,10 +1064,12 @@ const DrawingCard = ({ part, scope, updateScopeData, allScopes, isLeadAbatementS
                     {/* Left Column: Image / Status */}
                     <div className="md:col-span-1 space-y-3">
                         <div className="relative w-full aspect-[4/3] bg-gray-100 rounded-lg overflow-hidden shadow-inner flex items-center justify-center border">
-                            {localImageUrl ? (
-                                <img src={localImageUrl} alt={part.title} className="w-full h-full object-cover" />
+                            {isImageUploading ? (
+                                <Loader2 size={32} className="animate-spin text-indigo-500" />
+                            ) : displayImageUrl ? (
+                                <img src={displayImageUrl} alt={part.title} className="w-full h-full object-cover" />
                             ) : (
-                                <span className="text-gray-500 text-sm">No Image</span>
+                                <span className="text-gray-500 text-sm">No Part Image</span>
                             )}
                         </div>
 
@@ -949,11 +1081,19 @@ const DrawingCard = ({ part, scope, updateScopeData, allScopes, isLeadAbatementS
                                 accept="image/jpeg, image/png, image/jpg" 
                                 onChange={handleImageUpload} 
                                 className="hidden"
+                                disabled={isImageUploading}
                             />
-                            <label htmlFor={`image-upload-${part.id}`} className="cursor-pointer text-indigo-600 hover:text-indigo-700 text-sm font-semibold transition">
-                                Upload/Change Image
+                            <label 
+                                htmlFor={`image-upload-${part.id}`} 
+                                className={`cursor-pointer text-sm font-semibold transition flex items-center ${isImageUploading ? 'text-gray-500' : 'text-indigo-600 hover:text-indigo-700'}`}
+                            >
+                                <Upload size={14} className="mr-1" />
+                                {isImageUploading ? 'Uploading...' : 'Upload/Change Part Image'}
                             </label>
-                            <p className="text-xs text-gray-500 mt-1">Image is session-only (not saved).</p>
+                            {imageUploadError && <p className="text-xs text-red-500 mt-1">{imageUploadError}</p>}
+                            {!isImageUploading && !imageUploadError && (
+                                <p className="text-xs text-gray-500 mt-1">Image is saved permanently.</p>
+                            )}
                         </div>
                     </div>
                     
@@ -1049,7 +1189,7 @@ const DrawingCard = ({ part, scope, updateScopeData, allScopes, isLeadAbatementS
 
 
 // Renders the main content for any given scope page
-const ScopePage = ({ scope, updateScopeData, allScopes, setCurrentPage }) => {
+const ScopePage = ({ scope, updateScopeData, allScopes, setCurrentPage, uploadImage, userId }) => { // NEW: added uploadImage and userId
     // Determine if this is the special Lead Abatement page
     const isLeadAbatementScope = scope.id === 'lead_abatement';
     
@@ -1088,7 +1228,7 @@ const ScopePage = ({ scope, updateScopeData, allScopes, setCurrentPage }) => {
         updateScopeData(scope.id, { ...scope, parts: [...scope.parts, newPart] });
     };
 
-    // --- Report Export Function ---
+    // --- Report Export Function (No change needed here) ---
     const handleExport = () => {
         const printWindow = window.open('', '', 'height=800,width=800');
         printWindow.document.write('<html><head><title>MCR4 TMOD Report</title>');
@@ -1142,7 +1282,7 @@ const ScopePage = ({ scope, updateScopeData, allScopes, setCurrentPage }) => {
                     });
                 }
                 
-                // Since images are session-only, this is primarily for structural completeness.
+                // Use the permanent image URL saved in Firestore
                 const imageHtml = part.imageUrl ? 
                     `<div class="image-container"><img src="${part.imageUrl}" alt="Part Image" /></div>` : 
                     `<div class="image-container" style="display:flex; align-items:center; justify-content:center; background-color:#f0f0f0; color:#999; font-size:10px;">No Image</div>`;
@@ -1317,6 +1457,8 @@ const ScopePage = ({ scope, updateScopeData, allScopes, setCurrentPage }) => {
                             allScopes={nonSummaryAndSelfScopes}
                             isLeadAbatementScope={isLeadAbatementScope}
                             otherScopeIds={otherScopeIds}
+                            uploadImage={uploadImage} // NEW: Pass uploadImage
+                            userId={userId} // NEW: Pass userId
                         />
                     ))}
                     {(!scope.parts || scope.parts.length === 0) && (
@@ -1329,7 +1471,7 @@ const ScopePage = ({ scope, updateScopeData, allScopes, setCurrentPage }) => {
 };
 
 
-// Renders the main summary page
+// Renders the main summary page (No change needed here)
 const SummaryPage = ({ scopes, setCurrentPage }) => {
     const nonSummaryScopes = scopes.filter(s => s.type === 'scope');
     const totalScopes = nonSummaryScopes.length;
@@ -1417,7 +1559,7 @@ const SummaryPage = ({ scopes, setCurrentPage }) => {
 };
 
 
-// --- Sidebar Navigation Component ---
+// --- Sidebar Navigation Component (No change needed here) ---
 const Sidebar = ({ isOpen, toggleSidebar, currentPage, setCurrentPage, scopes, userId }) => {
     const handleNavigation = (pageId) => {
         setCurrentPage(pageId);
@@ -1475,7 +1617,7 @@ const Sidebar = ({ isOpen, toggleSidebar, currentPage, setCurrentPage, scopes, u
 
 // --- Main Application Component ---
 export default function App() {
-    const { scopes, userId, updateScopeData, isLoading, error } = useFirebase();
+    const { scopes, userId, updateScopeData, isLoading, error, uploadImage } = useFirebase(); // NEW: Destructure uploadImage
     const [currentPage, setCurrentPage] = useState('summary');
     const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
@@ -1498,8 +1640,8 @@ export default function App() {
                 </p>
                 <p className="text-sm text-center bg-red-100 p-3 rounded-lg border border-red-300">
                     Your environment must provide the global variables: 
-                    <code className="block mt-2 font-mono">VITE_APP_ID, VITE_FIREBASE_CONFIG, VITE_AUTH_TOKEN</code> 
-                    (using the VITE_ prefix for Netlify/Vite deployment).
+                    <code className="block mt-2 font-mono">__app_id, __firebase_config, __initial_auth_token</code> 
+                    (If running in a production environment, these must be set as environment variables like VITE_...).
                 </p>
                 <p className="text-sm font-semibold mt-4">User ID: {userId}</p>
             </div>
@@ -1536,6 +1678,8 @@ export default function App() {
                 updateScopeData={updateScopeData} 
                 allScopes={scopes} 
                 setCurrentPage={setCurrentPage} 
+                uploadImage={uploadImage} // NEW: Pass uploadImage
+                userId={userId} // NEW: Pass userId
             />
         );
     };
@@ -1572,7 +1716,7 @@ export default function App() {
                 {/* Footer showing User ID */}
                 <footer className="p-4 border-t bg-white text-xs text-gray-500 flex justify-between items-center">
                     <span>
-                        MCR4 TMODs Tracker v1.0 | Collaborative Progress
+                        MCR4 TMODs Tracker v2.0 | Collaborative Progress
                     </span>
                     <span>
                         User ID: {userId}
